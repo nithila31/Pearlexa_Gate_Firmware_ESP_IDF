@@ -7,5 +7,6 @@ idf_component_register(
         pearlexa_connect
         driver
         esp_timer
+        esp_security
         json
 )

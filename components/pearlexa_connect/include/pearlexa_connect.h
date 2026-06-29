@@ -18,15 +18,6 @@ typedef struct {
 
     int wifi_strength_period_ms;
 
-    // ---------- Optional Wi-Fi roaming config ----------
-    // Universal feature for devices installed near multiple APs with the same SSID/password.
-    // Disabled by default. Enable from Part B if needed.
-    bool wifi_roaming_enable;
-    int  wifi_roam_scan_period_ms;       // 0 = default 60000 ms
-    int  wifi_roam_weak_rssi;            // 0 = default -75 dBm
-    int  wifi_roam_margin_db;            // 0 = default 12 dB better AP required
-    int  wifi_roam_min_switch_gap_ms;    // 0 = default 300000 ms
-
     // ---------- OTA Config ----------
     // Example firmware_version: "1.0.0"
     // Example ota_version_url: "https://raw.githubusercontent.com/user/repo/main/version.json"

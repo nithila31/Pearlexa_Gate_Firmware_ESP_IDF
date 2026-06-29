@@ -1,16 +1,39 @@
 // =================================================================================
-// Pearlexa Connect reusable ESP-IDF component.
-// Universal connectivity/provisioning/MQTT/OTA layer.
-// Device-specific behavior belongs in the application main.c.
+// [A] Pearlexa_Connect "library" (UNIVERSAL, no pins) — FULL PART A WITH OTA - stable Wi-Fi/MQTT
+//
+// Added OTA support:
+//  - automatic OTA check only after Wi-Fi + MQTT are connected and stable
+//  - version.json download over HTTPS using ESP certificate bundle
+//  - semantic version comparison
+//  - .bin download and install using esp_https_ota()
+//  - rollback-safe OTA confirmation only after stable Wi-Fi + MQTT after reboot
+//  - optional MQTT command trigger: {"Firmware_Update":1}
+//
+// Part B must provide OTA fields in px_cfg_t:
+//  .firmware_version = APP_FW_VERSION,
+//  .ota_version_url = APP_OTA_VERSION_URL,
+//  .ota_check_on_boot = true,
+//  .ota_check_delay_ms = 10000,
+//  .ota_periodic_check_ms = 0,
+//
+// GitHub/raw version.json example:
+// {
+//   "version": "1.0.1",
+//   "bin_url": "https://raw.githubusercontent.com/YOUR_USERNAME/pearlexa-ota-test/main/Pearlexa-BP5758D-v1.0.1.bin",
+//   "force": false
+// }
+//
+// CMake note: if your main/CMakeLists.txt uses REQUIRES, add:
+// esp_https_ota esp_http_client app_update esp-tls esp_http_server
 // =================================================================================
-
-#include "pearlexa_connect.h"
 
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <inttypes.h>
+
+#include "driver/gpio.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -28,11 +51,13 @@
 #include "nvs.h"
 
 #include "esp_netif.h"
+#include "esp_netif_ip_addr.h"
 #include "esp_wifi.h"
 
 #include "mqtt_client.h"
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
+#include "esp_http_server.h"
 #include "esp_https_ota.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
@@ -46,9 +71,62 @@
 #include "host/ble_gap.h"
 #include "host/ble_gatt.h"
 #include "host/ble_uuid.h"
+#include "os/os_mbuf.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
+#define PX_TAG "Pearlexa"
+
+// ---------- Library Config ----------
+typedef struct {
+    const char* device_serial;
+    const char* auth_number;
+
+    const char* mqtt_host;
+    int         mqtt_tls_port;
+    const char* mqtt_wss_uri;
+
+    int wifi_strength_period_ms;
+
+    // ---------- OTA Config ----------
+    // Example firmware_version: "1.0.0"
+    // Example ota_version_url: "https://raw.githubusercontent.com/user/repo/main/version.json"
+    const char* firmware_version;
+    const char* ota_version_url;
+    bool        ota_check_on_boot;
+    int         ota_check_delay_ms;
+    int         ota_periodic_check_ms;   // 0 disables periodic checking
+
+    // Optional universal product metadata. Leave NULL/0 if not needed.
+    // If version.json includes "hardware" or "model", Part A can reject wrong firmware.
+    const char* hardware_model;          // example: "PX-SG100-DC250-24-X-V1"
+    const char* device_type;             // example: "gate_controller" / "smart_bulb"
+    int         ota_max_attempts;         // 0 = default 3 attempts per target version
+} px_cfg_t;
+
+typedef void (*px_msg_cb_t)(const char* topic, const char* json);
+typedef void (*px_app_void_cb_t)(void);
+typedef bool (*px_app_bool_cb_t)(void);
+
+// ---------- Library API ----------
+void px_init(const px_cfg_t* cfg);
+void px_start(void);
+void px_publish_json(const char* json);
+void px_set_message_callback(px_msg_cb_t cb);
+void px_force_ble_mode_and_restart(void);
+void px_ota_check_now(void);
+int  px_wifi_rssi(void);
+bool px_is_config_mode(void);
+bool px_boot_is_config_mode(void);
+bool px_mqtt_is_connected(void);
+bool px_wait_mqtt_connected(int timeout_ms);
+bool px_ota_update_is_in_progress(void);
+bool px_ota_first_boot_validation_pending(void);
+bool px_app_is_started(void);
+void px_set_app_start_callback(px_app_void_cb_t cb);
+void px_set_app_stop_callback(px_app_void_cb_t cb);
+void px_set_ota_prepare_callback(px_app_bool_cb_t cb);
+void px_set_app_self_test_callback(px_app_bool_cb_t cb);
 // ---------- Internal consts ----------
 #define PX_NVS_NS            "px"
 #define PX_KEY_SSID          "wifiSSID"
@@ -61,11 +139,112 @@
 #define PX_KEY_OTA_ATTEMPT   "otaAttempt"
 #define PX_KEY_OTA_FAIL      "otaFail"
 
-#define PX_KEEPALIVE_SEC               30
-#define PX_WIFI_CONNECT_TIMEOUT_MS  30000
+// Per-device identity keys stored in the existing px namespace.
+// These replace hardcoded APP_DEVICE_SERIAL / APP_AUTH_NUMBER in production.
+#define PX_KEY_DEVICE_SERIAL "deviceSerial"
+#define PX_KEY_AUTH_NUMBER   "authNumber"
+
+// Factory identity setup mode.
+// If deviceSerial/authNumber are missing, Part A connects to this factory Wi-Fi
+// using a static IP and exposes: http://192.168.1.10
+#ifndef PX_FACTORY_WIFI_SSID
+#define PX_FACTORY_WIFI_SSID      "Dream_theatre"
+#endif
+
+#ifndef PX_FACTORY_WIFI_PASSWORD
+#define PX_FACTORY_WIFI_PASSWORD  "Justlogin#365"
+#endif
+
+#ifndef PX_FACTORY_STATIC_IP_A
+#define PX_FACTORY_STATIC_IP_A 192
+#endif
+#ifndef PX_FACTORY_STATIC_IP_B
+#define PX_FACTORY_STATIC_IP_B 168
+#endif
+#ifndef PX_FACTORY_STATIC_IP_C
+#define PX_FACTORY_STATIC_IP_C 1
+#endif
+#ifndef PX_FACTORY_STATIC_IP_D
+#define PX_FACTORY_STATIC_IP_D 10
+#endif
+
+#ifndef PX_FACTORY_GATEWAY_A
+#define PX_FACTORY_GATEWAY_A 192
+#endif
+#ifndef PX_FACTORY_GATEWAY_B
+#define PX_FACTORY_GATEWAY_B 168
+#endif
+#ifndef PX_FACTORY_GATEWAY_C
+#define PX_FACTORY_GATEWAY_C 1
+#endif
+#ifndef PX_FACTORY_GATEWAY_D
+#define PX_FACTORY_GATEWAY_D 1
+#endif
+
+#ifndef PX_FACTORY_NETMASK_A
+#define PX_FACTORY_NETMASK_A 255
+#endif
+#ifndef PX_FACTORY_NETMASK_B
+#define PX_FACTORY_NETMASK_B 255
+#endif
+#ifndef PX_FACTORY_NETMASK_C
+#define PX_FACTORY_NETMASK_C 255
+#endif
+#ifndef PX_FACTORY_NETMASK_D
+#define PX_FACTORY_NETMASK_D 0
+#endif
+
+#ifndef PX_FACTORY_DNS_A
+#define PX_FACTORY_DNS_A 1
+#endif
+#ifndef PX_FACTORY_DNS_B
+#define PX_FACTORY_DNS_B 1
+#endif
+#ifndef PX_FACTORY_DNS_C
+#define PX_FACTORY_DNS_C 1
+#endif
+#ifndef PX_FACTORY_DNS_D
+#define PX_FACTORY_DNS_D 1
+#endif
+
+#define PX_FACTORY_SETUP_URL "http://192.168.1.10"
+
+// 1 = device identity must come from NVS/factory setup, even if Part B still
+// contains old hardcoded serial/token values. This helps enforce one common firmware.
+#ifndef PX_FORCE_NVS_IDENTITY
+#define PX_FORCE_NVS_IDENTITY 1
+#endif
+
+#define PX_FACTORY_HTTP_PORT             80
+#define PX_FACTORY_IDENTITY_POST_MAX    512
+#define PX_FACTORY_RECONNECT_PERIOD_MS 5000
+
+#define PX_KEEPALIVE_SEC               45
+#define PX_WIFI_CONNECT_TIMEOUT_MS  10000
 #define PX_WIFI_RECONNECT_PERIOD_MS 5000
-#define PX_ATTEMPT_TIMEOUT_MS         4000
-#define PX_ATTEMPT_COOLDOWN_MS         300
+
+/*
+ * WSS-only MQTT reliability policy:
+ * - Keep one esp-mqtt client alive and let esp-mqtt do its own reconnects.
+ * - Do not destroy/recreate the MQTT client on every WebSocket EOF.
+ * - Use a unique MQTT client ID suffix so ESP32 and ESP32-C3 test boards with
+ *   the same serial number do not kick each other off the broker.
+ */
+#define PX_ATTEMPT_TIMEOUT_MS       900000
+#define PX_ATTEMPT_COOLDOWN_MS        5000
+#define PX_MQTT_RECONNECT_TIMEOUT_MS  10000
+#define PX_MQTT_CLIENT_ID_ADD_MAC        1
+
+
+// ESP32-C3 optimized startup:
+// - Start product application after Wi-Fi is ready, without waiting for MQTT.
+// - Start the product app immediately after Wi-Fi so gate logic is available fast.
+// - Keep MQTT in the background with a reliable timeout.
+// - Use WSS only for both ESP32 and ESP32-C3. Native TLS is intentionally disabled.
+// - Use a moderate MQTT keepalive so WSS/proxy paths are not stressed by aggressive PING timing.
+#define PX_FAST_APP_START_AFTER_WIFI      1
+#define PX_PREFER_TLS_FIRST              0   // kept for compatibility; WSS-only runtime ignores TLS
+#define PX_MQTT_CONNECT_TIMEOUT_MS   20000
 #define PX_WIFI_ASSEMBLY_TIMEOUT_MS   1500
 #define PX_STATUS_JSON_MAX             512
 #define PX_WIFI_JSON_BUF_MAX           384
@@ -86,26 +265,36 @@
 #define PX_OTA_STATUS_SETTLE_MS        800
 #define PX_OTA_DEFAULT_MAX_ATTEMPTS      3
 
-#define PX_WIFI_ROAM_SCAN_MAX_RESULTS        20
-#define PX_WIFI_ROAM_SCAN_PERIOD_MS       60000
-#define PX_WIFI_ROAM_WEAK_RSSI              -75
-#define PX_WIFI_ROAM_MARGIN_DB               12
-#define PX_WIFI_ROAM_MIN_SWITCH_GAP_MS  300000
-#define PX_WIFI_RECOVERY_SCAN_GAP_MS      15000
 #define PX_MQTT_WIFI_FAULT_SUPPRESS_MS     8000
+#define PX_MQTT_WIFI_SUSPEND_GRACE_MS    8000
+
 
 /*
- * Product-grade AP scoring / bad-AP memory.
- * This prevents the ESP32 from repeatedly selecting a strong but unstable AP.
+ * Wi-Fi + MQTT intelligence layer.
+ * - Wi-Fi connected means GOT_IP, not only associated.
  */
-#define PX_WIFI_ROAM_AP_HISTORY_MAX          8
-#define PX_WIFI_ROAM_BLACKLIST_MS       300000
-#define PX_WIFI_ROAM_BAD_FAIL_LIMIT           2
-#define PX_WIFI_ROAM_FAIL_PENALTY            18
-#define PX_WIFI_ROAM_BEACON_PENALTY          25
-#define PX_WIFI_ROAM_SUCCESS_BONUS            4
-#define PX_WIFI_ROAM_CURRENT_AP_BONUS         8
-#define PX_WIFI_ROAM_BLACKLIST_FALLBACK_MS 30000
+#define PX_WIFI_WAIT_IP_AFTER_ASSOC_MS      30000
+#define PX_WIFI_IP_WAIT_LOG_PERIOD_MS        2000
+#define PX_MQTT_FAULT_WINDOW_MS            120000
+
+/*
+ * Wi-Fi/MQTT cross-intelligence:
+ * A MQTT PING timeout can happen first while the Wi-Fi driver still holds an IP
+ * bit during beacon timeout / AP probing. Do not immediately blame MQTT. Hold
+ * the MQTT fault briefly; if Wi-Fi disconnects in this window, classify it as a
+ * Wi-Fi root fault. Only count it as a real MQTT fault if Wi-Fi remains IP-ready.
+ */
+#define PX_MQTT_FAULT_CLASSIFY_DELAY_MS     20000
+#define PX_WIFI_RECENT_LOSS_CLASSIFY_MS     12000
+
+
+/*
+ * RSSI averaging:
+ * A single RSSI read can jump several dB. Use a few samples for published
+ * Wi-Fi strength publishing.
+ */
+#define PX_WIFI_RSSI_SAMPLE_COUNT             5
+#define PX_WIFI_RSSI_SAMPLE_DELAY_MS         80
 
 typedef enum { PX_TRANS_WSS=0, PX_TRANS_TLS=1 } px_transport_t;
 typedef enum { PX_ST_DISCONNECTED=0, PX_ST_CONNECTING=1, PX_ST_CONNECTED=2 } px_conn_state_t;
@@ -114,22 +303,9 @@ typedef enum {
     PX_NET_FAULT_NONE = 0,
     PX_NET_FAULT_WIFI_DISCONNECT,
     PX_NET_FAULT_WIFI_BEACON_TIMEOUT,
-    PX_NET_FAULT_WIFI_ROAMING,
     PX_NET_FAULT_MQTT_TRANSPORT,
 } px_net_fault_t;
 
-typedef struct {
-    bool valid;
-    uint8_t bssid[6];
-    uint8_t channel;
-    int last_rssi;
-    int fail_count;
-    int success_count;
-    int beacon_timeout_count;
-    uint64_t last_seen_ms;
-    uint64_t last_connected_ms;
-    uint64_t blacklist_until_ms;
-} px_roam_ap_history_t;
 
 typedef enum {
     PX_OTA_PHASE_IDLE = 0,
@@ -180,8 +356,19 @@ static px_cfg_t G = {0};
 static nvs_handle_t px_nvs = 0;
 static EventGroupHandle_t px_wifi_group = NULL;
 static const int PXWIFI_CONNECTED_BIT = BIT0;
+static const int PXWIFI_FAIL_BIT      = BIT1;
 
 static char px_topic_tx[64], px_topic_rx[64], px_topic_status[64];
+static char px_mqtt_client_id[96] = {0};
+
+// NVS-loaded identity buffers. G.device_serial and G.auth_number point to these
+// when Part B passes NULL/empty values.
+static char px_device_serial_nvs[64] = {0};
+static char px_auth_number_nvs[128] = {0};
+static bool px_identity_ready = false;
+static bool px_factory_identity_mode = false;
+static httpd_handle_t px_factory_httpd = NULL;
+static uint64_t px_factory_last_reconnect_ms = 0;
 
 static px_transport_t px_current_transport = PX_TRANS_WSS;
 static px_conn_state_t px_ws_state = PX_ST_DISCONNECTED, px_tls_state = PX_ST_DISCONNECTED;
@@ -193,19 +380,24 @@ static px_msg_cb_t px_user_msg_cb = NULL;
 
 static uint64_t px_last_wifi_ms = 0;
 static uint64_t px_last_wifi_reconnect_ms = 0;
-static uint64_t px_last_roam_scan_ms = 0;
-static uint64_t px_last_roam_switch_ms = 0;
-static volatile bool px_wifi_roam_in_progress = false;
-static volatile bool px_wifi_recovery_in_progress = false;
 static int32_t px_last_wifi_disconnect_reason = -1;
 static uint64_t px_last_wifi_disconnect_ms = 0;
-static uint64_t px_last_wifi_recovery_scan_ms = 0;
+static uint64_t px_wifi_ip_lost_since_ms = 0;
 static uint64_t px_mqtt_wifi_fault_suppress_until_ms = 0;
 static px_net_fault_t px_last_net_fault = PX_NET_FAULT_NONE;
+static uint64_t px_wifi_associated_ms = 0;
+static uint64_t px_wifi_last_wait_ip_log_ms = 0;
 
-static px_roam_ap_history_t px_roam_ap_history[PX_WIFI_ROAM_AP_HISTORY_MAX];
-static uint8_t px_current_bssid[6] = {0};
-static bool px_current_bssid_valid = false;
+static int px_mqtt_transport_fault_count = 0;
+static uint64_t px_mqtt_transport_fault_window_ms = 0;
+static uint64_t px_mqtt_last_connected_ms = 0;
+static uint64_t px_mqtt_last_fault_ms = 0;
+
+static volatile bool px_mqtt_suspended_for_wifi = false;
+static uint64_t px_mqtt_fault_pending_until_ms = 0;
+static uint64_t px_mqtt_fault_pending_started_ms = 0;
+
+
 
 static char     px_wifi_buf[PX_WIFI_JSON_BUF_MAX];
 static size_t   px_wifi_len = 0;
@@ -229,6 +421,15 @@ static bool px_wifi_handlers_registered = false;
 
 static QueueHandle_t px_prov_queue = NULL;
 
+// BLE JSON parsing is moved out of the NimBLE GATT callback for ESP32-C3 safety.
+typedef struct {
+    uint16_t len;
+    char json[PX_WIFI_JSON_BUF_MAX];
+} px_ble_json_msg_t;
+
+static QueueHandle_t px_ble_json_queue = NULL;
+static TaskHandle_t px_ble_json_task_handle = NULL;
+
 // ---------- OTA state ----------
 static volatile bool px_ota_task_running = false;
 static volatile bool px_ota_update_in_progress_flag = false;
@@ -236,6 +437,10 @@ static volatile bool px_ota_checked_once = false;
 static volatile bool px_ota_manual_request = false;
 
 static bool px_ota_pending_verify = false;
+static char px_last_ota_state_sent[40] = {0};
+static char px_last_ota_target_sent[40] = {0};
+static bool px_last_ota_progress_sent = false;
+static bool px_last_ota_progress_valid = false;
 
 static uint64_t px_ota_last_check_ms = 0;
 static uint64_t px_ota_online_stable_since_ms = 0;
@@ -247,6 +452,10 @@ static px_app_bool_cb_t px_app_prepare_ota_cb = NULL;
 static px_app_bool_cb_t px_app_self_test_cb = NULL;
 static volatile bool px_app_started_flag = false;
 static volatile bool px_app_start_allowed = true;
+static TaskHandle_t px_app_task_handle = NULL;
+
+#define PX_APP_TASK_STACK_SIZE 8192
+#define PX_APP_TASK_PRIO       5
 
 // ---------- Provisioning txn state ----------
 static int px_status_seq = 0;
@@ -285,27 +494,15 @@ static void px_ota_set_phase(px_ota_phase_t phase);
 static px_ota_phase_t px_ota_get_phase(void);
 static void px_publish_ota_status(const char *state, const char *server_version, const char *message);
 static void px_publish_firmware_info_now(void);
+static void px_mqtt_transport_fault_note(bool wifi_root_fault);
+static void px_mqtt_transport_connected_note(void);
+static void px_mqtt_suspend_until_wifi_ready(void);
+static void px_mqtt_fault_deferred_check(void);
+static void px_wifi_stack_ensure_ready(void);
+static bool px_identity_load_or_bind_from_nvs(void);
+static void px_factory_identity_start(void);
+static void px_factory_identity_reconnect_if_needed(void);
 
-static void px_wifi_roaming_check_if_due(void);
-static bool px_wifi_select_best_ap_config(bool force_scan);
-
-/* Roaming/AP reliability history helpers */
-static void px_roam_history_note_connected(const wifi_ap_record_t *ap);
-static void px_roam_history_note_disconnect(int32_t reason);
-static int  px_roam_ap_score(const wifi_ap_record_t *ap,
-                            const wifi_ap_record_t *current_ap,
-                            bool is_current,
-                            bool *is_blacklisted_out);
-static bool px_roam_choose_best_from_scan(const wifi_ap_record_t *aps,
-                                          uint16_t count,
-                                          const char *ssid,
-                                          const wifi_ap_record_t *current_ap,
-                                          bool recovery_mode,
-                                          bool allow_blacklisted,
-                                          wifi_ap_record_t *best_out,
-                                          int *best_score_out,
-                                          int *current_score_out);
-static const char *px_bssid_fmt(const uint8_t bssid[6], char *out, size_t outlen);
 
 // ---------- Small utils ----------
 static inline uint64_t px_nowUs(void){ return esp_timer_get_time(); }
@@ -379,6 +576,40 @@ static const char* px_auth_mode_str(wifi_auth_mode_t mode) {
         case WIFI_AUTH_WAPI_PSK: return "WAPI_PSK";
         default: return "UNKNOWN";
     }
+}
+
+
+
+static void px_wifi_build_config_from_ap(wifi_config_t *w,
+                                         const char *ssid,
+                                         const char *pass,
+                                         const wifi_ap_record_t *ap)
+{
+    (void)ap;
+
+    if (!w) return;
+
+    memset(w, 0, sizeof(*w));
+
+    strlcpy((char *)w->sta.ssid, ssid ? ssid : "", sizeof(w->sta.ssid));
+    strlcpy((char *)w->sta.password, pass ? pass : "", sizeof(w->sta.password));
+
+    /*
+     * Stable normal station connection:
+     * Do not lock to a specific AP MAC/channel. Let the ESP-IDF Wi-Fi driver
+     * associate normally using the saved SSID/password.
+     */
+    w->sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    w->sta.pmf_cfg.capable = true;
+    w->sta.pmf_cfg.required = false;
+    w->sta.channel = 0;
+
+    ESP_LOGI(PX_TAG,
+             "Wi-Fi config: SSID=%s AUTH>=%s PMF(cap=%d req=%d)",
+             ssid ? ssid : "",
+             px_auth_mode_str(w->sta.threshold.authmode),
+             (int)w->sta.pmf_cfg.capable,
+             (int)w->sta.pmf_cfg.required);
 }
 
 static const char* px_stage_name(px_txn_stage_t s) {
@@ -496,6 +727,26 @@ static void px_rst_clear_timer_cb(void* arg){
 
 
 // ---------- Universal App lifecycle ----------
+static void px_app_task_entry(void *arg)
+{
+    (void)arg;
+
+    ESP_LOGI(PX_TAG, "Part B application task started");
+
+    if (px_app_start_cb) {
+        px_app_start_cb();
+    }
+
+    /*
+     * If Part B's start callback returns, keep the flag true but clear the
+     * task handle. Most products should create their own tasks and return,
+     * or run here with regular vTaskDelay()/yield calls.
+     */
+    ESP_LOGW(PX_TAG, "Part B start callback returned");
+    px_app_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
 static void px_app_start_if_allowed(void)
 {
     if (px_is_ble_mode_flag) return;
@@ -506,8 +757,24 @@ static void px_app_start_if_allowed(void)
 
     if (px_app_start_cb) {
         ESP_LOGI(PX_TAG, "Starting product application via Part B callback");
-        px_app_start_cb();
+
         px_app_started_flag = true;
+
+        BaseType_t ok = xTaskCreatePinnedToCore(
+            px_app_task_entry,
+            "px_app_task",
+            PX_APP_TASK_STACK_SIZE,
+            NULL,
+            PX_APP_TASK_PRIO,
+            &px_app_task_handle,
+            tskNO_AFFINITY
+        );
+
+        if (ok != pdPASS) {
+            ESP_LOGE(PX_TAG, "Failed to create Part B application task");
+            px_app_task_handle = NULL;
+            px_app_started_flag = false;
+        }
     }
 }
 
@@ -516,9 +783,16 @@ static void px_app_stop_if_started(void)
     if (!px_app_started_flag) return;
 
     ESP_LOGI(PX_TAG, "Stopping product application via Part B callback");
+
     if (px_app_stop_cb) {
         px_app_stop_cb();
     }
+
+    /*
+     * Do not force-delete the Part B task here unless the Part B stop callback
+     * cannot stop it cleanly. A forced delete can leave drivers/peripherals in
+     * an unsafe state. Part B should exit/idle its own loop when stop is called.
+     */
     px_app_started_flag = false;
 }
 
@@ -641,57 +915,7 @@ static void px_ota_record_attempt(const char *target_version)
     px_nvs_set_int(PX_KEY_OTA_ATTEMPT, attempt);
 }
 
-static bool px_ota_metadata_allowed(cJSON *root, const char *server_version)
-{
-    (void)server_version;
-
-    if (!root) return true;
-
-    cJSON *hw = cJSON_GetObjectItem(root, "hardware");
-    if (cJSON_IsString(hw) && hw->valuestring && G.hardware_model && G.hardware_model[0]) {
-        if (strcmp(hw->valuestring, G.hardware_model) != 0) {
-            ESP_LOGW(PX_TAG, "OTA rejected: hardware mismatch server=%s device=%s", hw->valuestring, G.hardware_model);
-            return false;
-        }
-    }
-
-    cJSON *model = cJSON_GetObjectItem(root, "model");
-    if (cJSON_IsString(model) && model->valuestring && G.device_type && G.device_type[0]) {
-        if (strcmp(model->valuestring, G.device_type) != 0) {
-            ESP_LOGW(PX_TAG, "OTA rejected: model mismatch server=%s device=%s", model->valuestring, G.device_type);
-            return false;
-        }
-    }
-
-    cJSON *minv = cJSON_GetObjectItem(root, "min_current_version");
-    if (cJSON_IsString(minv) && minv->valuestring && G.firmware_version) {
-        if (px_version_compare(G.firmware_version, minv->valuestring) < 0) {
-            ESP_LOGW(PX_TAG, "OTA rejected: current version %s is lower than minimum %s", G.firmware_version, minv->valuestring);
-            return false;
-        }
-    }
-
-    cJSON *rollout = cJSON_GetObjectItem(root, "rollout");
-    if (cJSON_IsNumber(rollout)) {
-        int percent = rollout->valueint;
-        if (percent < 0) percent = 0;
-        if (percent > 100) percent = 100;
-        if (percent < 100 && G.device_serial) {
-            uint32_t h = 2166136261u;
-            for (const char *p = G.device_serial; *p; ++p) {
-                h ^= (uint8_t)(*p);
-                h *= 16777619u;
-            }
-            int bucket = (int)(h % 100u);
-            if (bucket >= percent) {
-                ESP_LOGI(PX_TAG, "OTA rollout skip: bucket=%d rollout=%d", bucket, percent);
-                return false;
-            }
-        }
-    }
-
-    return true;
-}
+/* OTA metadata parsing is handled by px_ota_metadata_allowed_json() without cJSON_Parse(). */
 
 // ---------- OTA boot confirmation ----------
 static bool px_ota_running_app_is_pending_verify(void)
@@ -813,10 +1037,16 @@ static void px_status_notify_now(void){
     if (px_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
     if (px_status_val_handle == 0) return;
 
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(px_status_json, strlen(px_status_json));
+    if (!om) {
+        ESP_LOGW(PX_TAG, "BLE status notify skipped: mbuf allocation failed");
+        return;
+    }
+
     int rc = ble_gatts_notify_custom(
         px_conn_handle,
         px_status_val_handle,
-        ble_hs_mbuf_from_flat(px_status_json, strlen(px_status_json))
+        om
     );
 
     if (rc == 0) {
@@ -937,63 +1167,120 @@ static bool px_wifi_is_connected(void) {
     return (bits & PXWIFI_CONNECTED_BIT) != 0;
 }
 
+static bool px_wifi_reason_is_fast_connect_fail(int32_t reason)
+{
+    /*
+     * These are connection/authentication/association failures. When one of
+     * these happens during the first selected connection attempt, do not wait for
+     * the full Wi-Fi timeout. Exit the wait quickly and try the safe fallback.
+     * Numeric values are used intentionally to avoid SDK enum-name differences.
+     * Common ESP-IDF values:
+     * 202 = AUTH_FAIL
+     * 203 = ASSOC_FAIL
+     * 204 = HANDSHAKE_TIMEOUT
+     * 205 = CONNECTION_FAIL
+     * 36  = association/auth comeback related failure seen on some WPA3 APs
+     */
+    switch ((int)reason) {
+        case 202:
+        case 203:
+        case 204:
+        case 205:
+        case 36:
+            return true;
+        default:
+            return false;
+    }
+}
+
+
 static void px_wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, void* data)
 {
     (void)arg;
 
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED) {
+        /*
+         * Associated is not equal to internet-ready. Wait for IP_EVENT_STA_GOT_IP
+         * before starting MQTT/DNS/OTA. This prevents getaddrinfo() failures when
+         * MQTT starts during DHCP.
+         */
         xEventGroupClearBits(px_wifi_events(), PXWIFI_CONNECTED_BIT);
+        px_wifi_associated_ms = px_nowMs();
+        px_wifi_last_wait_ip_log_ms = px_wifi_associated_ms;
+        ESP_LOGI(PX_TAG, "Wi-Fi associated; waiting for GOT_IP before MQTT/OTA");
+
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        xEventGroupClearBits(px_wifi_events(), PXWIFI_CONNECTED_BIT);
+        px_wifi_associated_ms = 0;
+        px_wifi_last_wait_ip_log_ms = 0;
         px_ota_online_stable_since_ms = 0;
 
         uint64_t now = px_nowMs();
         px_last_wifi_disconnect_ms = now;
+        if (px_wifi_ip_lost_since_ms == 0) {
+            px_wifi_ip_lost_since_ms = now;
+        }
         px_mqtt_wifi_fault_suppress_until_ms = now + PX_MQTT_WIFI_FAULT_SUPPRESS_MS;
 
         wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)data;
         px_last_wifi_disconnect_reason = disc ? disc->reason : -1;
 
-        /*
-         * Learn from AP failures. If the current BSSID caused beacon timeouts or
-         * repeated disconnects, future roaming/recovery scans will penalize it.
-         */
-        px_roam_history_note_disconnect(px_last_wifi_disconnect_reason);
+        if (px_wifi_reason_is_fast_connect_fail(px_last_wifi_disconnect_reason)) {
+            xEventGroupSetBits(px_wifi_events(), PXWIFI_FAIL_BIT);
+            ESP_LOGW(PX_TAG,
+                     "Wi-Fi fast-fail reason=%ld -> releasing startup wait for fallback retry",
+                     (long)px_last_wifi_disconnect_reason);
+        }
 
-        if (px_wifi_roam_in_progress) {
-            px_last_net_fault = PX_NET_FAULT_WIFI_ROAMING;
-            ESP_LOGW(PX_TAG, "Wi-Fi disconnected during intentional roaming, reason=%ld", (long)px_last_wifi_disconnect_reason);
-        } else if (px_last_wifi_disconnect_reason == WIFI_REASON_BEACON_TIMEOUT) {
+        if (px_last_wifi_disconnect_reason == WIFI_REASON_BEACON_TIMEOUT) {
             px_last_net_fault = PX_NET_FAULT_WIFI_BEACON_TIMEOUT;
-            ESP_LOGW(PX_TAG, "Wi-Fi root fault: beacon timeout / AP lost, reason=%ld", (long)px_last_wifi_disconnect_reason);
+            ESP_LOGW(PX_TAG,
+                     "Wi-Fi root fault: beacon timeout / AP lost, reason=%ld heap=%lu",
+                     (long)px_last_wifi_disconnect_reason,
+                     (unsigned long)esp_get_free_heap_size());
         } else {
             px_last_net_fault = PX_NET_FAULT_WIFI_DISCONNECT;
-            ESP_LOGW(PX_TAG, "Wi-Fi root fault: disconnected, reason=%ld", (long)px_last_wifi_disconnect_reason);
+            ESP_LOGW(PX_TAG,
+                     "Wi-Fi root fault: disconnected, reason=%ld heap=%lu",
+                     (long)px_last_wifi_disconnect_reason,
+                     (unsigned long)esp_get_free_heap_size());
         }
 
         /*
-         * MQTT read errors immediately after this are only a symptom of Wi-Fi loss.
-         * Stop/destroy MQTT here, then the service task will reconnect Wi-Fi first,
-         * and only after Wi-Fi is back it will rebuild MQTT cleanly.
+         * Do not stop/destroy esp-mqtt from the Wi-Fi event callback.
+         * Keep the client alive and let esp-mqtt auto-reconnect after Wi-Fi returns.
          */
+        px_mqtt_suspended_for_wifi = true;
+        px_mqtt_fault_pending_until_ms = 0;
+        px_mqtt_fault_pending_started_ms = 0;
+        px_mqtt_transport_fault_count = 0;
+
         if (px_mqtt) {
-            px_mqtt_stop_if_any();
+            if (px_current_transport == PX_TRANS_WSS) px_ws_state = PX_ST_CONNECTING;
+            else px_tls_state = PX_ST_CONNECTING;
+            px_attempt_start_us = px_nowUs();
+        } else {
+            px_ws_state = PX_ST_DISCONNECTED;
+            px_tls_state = PX_ST_DISCONNECTED;
         }
-        px_ws_state = PX_ST_DISCONNECTED;
-        px_tls_state = PX_ST_DISCONNECTED;
 
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         xEventGroupSetBits(px_wifi_events(), PXWIFI_CONNECTED_BIT);
+        px_wifi_ip_lost_since_ms = 0;
+        px_mqtt_suspended_for_wifi = false;
+        px_mqtt_wifi_fault_suppress_until_ms = px_nowMs() + 2000;
+        px_wifi_associated_ms = 0;
+        px_wifi_last_wait_ip_log_ms = 0;
+        px_mqtt_fault_pending_until_ms = 0;
+        px_mqtt_fault_pending_started_ms = 0;
+        px_mqtt_transport_fault_count = 0;
         px_last_wifi_reconnect_ms = 0;
-        px_wifi_roam_in_progress = false;
-        px_wifi_recovery_in_progress = false;
 
         wifi_ap_record_t ap;
         if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
-            px_roam_history_note_connected(&ap);
             ESP_LOGI(PX_TAG,
-                     "Wi-Fi got IP. Connected AP RSSI=%d CH=%d BSSID=%02x:%02x:%02x:%02x:%02x:%02x last_reason=%ld",
+                     "Wi-Fi got IP. Connected AP RSSI=%d CH=%d last_reason=%ld",
                      ap.rssi, ap.primary,
-                     ap.bssid[0], ap.bssid[1], ap.bssid[2],
-                     ap.bssid[3], ap.bssid[4], ap.bssid[5],
                      (long)px_last_wifi_disconnect_reason);
         } else {
             ESP_LOGI(PX_TAG, "Wi-Fi got IP. Network recovery complete, last_reason=%ld",
@@ -1012,6 +1299,357 @@ static void px_build_hostname_from_serial(const char* serial, char* out, size_t 
     while (*s==' ' || *s=='-' || *s=='_') s++;
 
     snprintf(out, outlen, "Pearlexa-SN-%s", s);
+}
+
+static void px_build_mqtt_client_id(void)
+{
+    if (!G.device_serial || !G.device_serial[0]) {
+        strlcpy(px_mqtt_client_id, "Pearlexa-unknown", sizeof(px_mqtt_client_id));
+        return;
+    }
+
+#if PX_MQTT_CLIENT_ID_ADD_MAC
+    uint8_t mac[6] = {0};
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) {
+        esp_read_mac(mac, ESP_MAC_BASE);
+    }
+
+    /*
+     * MQTT brokers allow only one active connection for a given client_id.
+     * Keeping username as the serial preserves auth/ACL behavior, while adding
+     * the MAC suffix to client_id prevents ESP32 and ESP32-C3 lab boards with
+     * the same serial from disconnecting each other.
+     */
+    snprintf(px_mqtt_client_id, sizeof(px_mqtt_client_id),
+             "%s-%02X%02X%02X", G.device_serial, mac[3], mac[4], mac[5]);
+#else
+    strlcpy(px_mqtt_client_id, G.device_serial, sizeof(px_mqtt_client_id));
+#endif
+
+    ESP_LOGI(PX_TAG, "MQTT client_id=%s username=%s", px_mqtt_client_id, G.device_serial);
+}
+
+
+// ---------- Factory identity setup over factory Wi-Fi + static IP ----------
+static bool px_identity_load_or_bind_from_nvs(void)
+{
+    px_device_serial_nvs[0] = 0;
+    px_auth_number_nvs[0] = 0;
+
+    /* Production mode: NVS is the source of truth. This allows one common
+     * firmware for all devices and prevents old hardcoded Part B values from
+     * accidentally being used.
+     */
+    px_nvs_get_strz(PX_KEY_DEVICE_SERIAL, px_device_serial_nvs, sizeof(px_device_serial_nvs));
+    px_nvs_get_strz(PX_KEY_AUTH_NUMBER, px_auth_number_nvs, sizeof(px_auth_number_nvs));
+
+#if !PX_FORCE_NVS_IDENTITY
+    /* Development fallback only. Leave PX_FORCE_NVS_IDENTITY=1 for production. */
+    if (px_device_serial_nvs[0] == '\0' && G.device_serial && G.device_serial[0]) {
+        strlcpy(px_device_serial_nvs, G.device_serial, sizeof(px_device_serial_nvs));
+    }
+    if (px_auth_number_nvs[0] == '\0' && G.auth_number && G.auth_number[0]) {
+        strlcpy(px_auth_number_nvs, G.auth_number, sizeof(px_auth_number_nvs));
+    }
+#endif
+
+    px_identity_ready = (px_device_serial_nvs[0] != '\0' && px_auth_number_nvs[0] != '\0');
+
+    if (px_identity_ready) {
+        G.device_serial = px_device_serial_nvs;
+        G.auth_number = px_auth_number_nvs;
+        ESP_LOGI(PX_TAG, "Device identity ready: serial=%s", G.device_serial);
+        return true;
+    }
+
+    ESP_LOGW(PX_TAG,
+             "Device identity missing. Factory setup will start at %s after factory Wi-Fi connection.",
+             PX_FACTORY_SETUP_URL);
+    return false;
+}
+
+static char px_hex_to_char(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return 0;
+}
+
+static void px_url_decode_inplace(char *s)
+{
+    if (!s) return;
+    char *r = s;
+    char *w = s;
+
+    while (*r) {
+        if (*r == '+') {
+            *w++ = ' ';
+            r++;
+        } else if (*r == '%' && r[1] && r[2]) {
+            *w++ = (char)((px_hex_to_char(r[1]) << 4) | px_hex_to_char(r[2]));
+            r += 3;
+        } else {
+            *w++ = *r++;
+        }
+    }
+    *w = 0;
+}
+
+static bool px_form_get_value(const char *body, const char *key, char *out, size_t outlen)
+{
+    if (!body || !key || !out || outlen == 0) return false;
+    out[0] = 0;
+
+    size_t key_len = strlen(key);
+    const char *p = body;
+
+    while (p && *p) {
+        if (strncmp(p, key, key_len) == 0 && p[key_len] == '=') {
+            p += key_len + 1;
+            size_t n = 0;
+            while (*p && *p != '&' && n < outlen - 1) {
+                out[n++] = *p++;
+            }
+            out[n] = 0;
+            px_url_decode_inplace(out);
+            return out[0] != 0;
+        }
+
+        p = strchr(p, '&');
+        if (p) p++;
+    }
+
+    return false;
+}
+
+static void px_factory_delayed_restart_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(900));
+    esp_restart();
+}
+
+static esp_err_t px_factory_http_root_get(httpd_req_t *req)
+{
+    char page[1600];
+    snprintf(page, sizeof(page),
+             "<!doctype html><html><head>"
+             "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+             "<title>Pearlexa Factory Setup</title>"
+             "<style>body{font-family:Arial,sans-serif;background:#f7f7f7;margin:0;padding:24px;}"
+             ".card{max-width:520px;margin:auto;background:white;padding:24px;border-radius:18px;box-shadow:0 8px 28px #0001;}"
+             "h2{margin-top:0;}label{display:block;margin-top:14px;font-weight:600;}"
+             "input{width:100%%;box-sizing:border-box;padding:12px;margin-top:6px;border:1px solid #ccc;border-radius:10px;font-size:16px;}"
+             "button{width:100%%;margin-top:20px;padding:13px;border:0;border-radius:10px;background:#111;color:white;font-size:16px;}"
+             ".hint{font-size:13px;color:#666;line-height:1.45;}code{background:#eee;padding:2px 5px;border-radius:4px;}"
+             "</style></head><body><div class='card'>"
+             "<h2>Pearlexa Factory Identity Setup</h2>"
+             "<p class='hint'>Enter the per-device serial number and auth token. "
+             "After saving, the device will restart and this page will be disabled.</p>"
+             "<form method='POST' action='/save'>"
+             "<label>Device Serial</label>"
+             "<input name='deviceSerial' placeholder='SN:G1005005' required maxlength='63'>"
+             "<label>Auth Token</label>"
+             "<input name='authNumber' placeholder='Device-specific token' required maxlength='127'>"
+             "<button type='submit'>Save Identity</button>"
+             "</form>"
+             "<p class='hint'>URL: <code>%s</code></p>"
+             "</div></body></html>", PX_FACTORY_SETUP_URL);
+
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, page, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t px_factory_http_save_post(httpd_req_t *req)
+{
+    char body[PX_FACTORY_IDENTITY_POST_MAX] = {0};
+    int remaining = req->content_len;
+    int received_total = 0;
+
+    while (remaining > 0 && received_total < (int)sizeof(body) - 1) {
+        int chunk = remaining;
+        int room = (int)sizeof(body) - 1 - received_total;
+        if (chunk > room) chunk = room;
+
+        int r = httpd_req_recv(req, body + received_total, chunk);
+        if (r <= 0) {
+            if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive failed");
+            return ESP_FAIL;
+        }
+
+        received_total += r;
+        remaining -= r;
+    }
+    body[received_total] = 0;
+
+    char serial[64] = {0};
+    char token[128] = {0};
+
+    bool ok_serial = px_form_get_value(body, "deviceSerial", serial, sizeof(serial));
+    bool ok_token  = px_form_get_value(body, "authNumber", token, sizeof(token));
+
+    if (!ok_serial || !ok_token || strlen(serial) < 3 || strlen(token) < 8) {
+        httpd_resp_set_type(req, "text/html");
+        return httpd_resp_sendstr(req,
+            "<html><body><h3>Invalid serial or token</h3>"
+            "<p>Please go back and check the values.</p></body></html>");
+    }
+
+    px_nvs_set_str_safe(PX_KEY_DEVICE_SERIAL, serial);
+    px_nvs_set_str_safe(PX_KEY_AUTH_NUMBER, token);
+
+    /* Keep customer Wi-Fi provisioning behavior available after identity setup. */
+    px_nvs_set_bool(PX_KEY_CFG_MODE, false);
+    px_nvs_set_bool(PX_KEY_CFG_LOCK, false);
+
+    ESP_LOGI(PX_TAG, "Factory identity saved: serial=%s. Restarting.", serial);
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_sendstr(req,
+        "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>Saved</title></head><body style='font-family:Arial;padding:24px;'>"
+        "<h2>Identity Saved</h2><p>The device is restarting now.</p></body></html>");
+
+    xTaskCreate(px_factory_delayed_restart_task,
+                "px_id_restart",
+                2048,
+                NULL,
+                5,
+                NULL);
+    return ESP_OK;
+}
+
+static esp_err_t px_factory_http_not_found(httpd_req_t *req, httpd_err_code_t err)
+{
+    (void)err;
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/");
+    return httpd_resp_send(req, NULL, 0);
+}
+
+static void px_factory_web_start(void)
+{
+    if (px_factory_httpd) return;
+
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = PX_FACTORY_HTTP_PORT;
+    config.lru_purge_enable = true;
+    config.stack_size = 6144;
+
+    esp_err_t err = httpd_start(&px_factory_httpd, &config);
+    if (err != ESP_OK) {
+        ESP_LOGE(PX_TAG, "Factory HTTP server start failed: %s", esp_err_to_name(err));
+        px_factory_httpd = NULL;
+        return;
+    }
+
+    httpd_uri_t root = {
+        .uri = "/",
+        .method = HTTP_GET,
+        .handler = px_factory_http_root_get,
+        .user_ctx = NULL
+    };
+
+    httpd_uri_t save = {
+        .uri = "/save",
+        .method = HTTP_POST,
+        .handler = px_factory_http_save_post,
+        .user_ctx = NULL
+    };
+
+    httpd_register_uri_handler(px_factory_httpd, &root);
+    httpd_register_uri_handler(px_factory_httpd, &save);
+    httpd_register_err_handler(px_factory_httpd, HTTPD_404_NOT_FOUND, px_factory_http_not_found);
+
+    ESP_LOGW(PX_TAG,
+             "Factory identity web setup ready. Open: %s",
+             PX_FACTORY_SETUP_URL);
+}
+
+static void px_factory_identity_start(void)
+{
+    ESP_LOGW(PX_TAG,
+             "Factory identity mode: connecting to SSID='%s' with static IP %s",
+             PX_FACTORY_WIFI_SSID,
+             PX_FACTORY_SETUP_URL);
+
+    px_wifi_stack_ensure_ready();
+
+    if (px_netif) {
+        /* Factory setup uses a fixed IP so the operator can always open
+         * http://192.168.1.10 without checking the router DHCP list.
+         */
+        (void)esp_netif_dhcpc_stop(px_netif);
+
+        esp_netif_ip_info_t ip_info = {0};
+        ip_info.ip.addr = ESP_IP4TOADDR(PX_FACTORY_STATIC_IP_A, PX_FACTORY_STATIC_IP_B, PX_FACTORY_STATIC_IP_C, PX_FACTORY_STATIC_IP_D);
+        ip_info.gw.addr = ESP_IP4TOADDR(PX_FACTORY_GATEWAY_A, PX_FACTORY_GATEWAY_B, PX_FACTORY_GATEWAY_C, PX_FACTORY_GATEWAY_D);
+        ip_info.netmask.addr = ESP_IP4TOADDR(PX_FACTORY_NETMASK_A, PX_FACTORY_NETMASK_B, PX_FACTORY_NETMASK_C, PX_FACTORY_NETMASK_D);
+
+        esp_err_t ip_err = esp_netif_set_ip_info(px_netif, &ip_info);
+        if (ip_err != ESP_OK) {
+            ESP_LOGW(PX_TAG, "Factory static IP set failed: %s", esp_err_to_name(ip_err));
+        }
+
+        esp_netif_dns_info_t dns = {0};
+        dns.ip.type = ESP_IPADDR_TYPE_V4;
+        dns.ip.u_addr.ip4.addr = ESP_IP4TOADDR(PX_FACTORY_DNS_A, PX_FACTORY_DNS_B, PX_FACTORY_DNS_C, PX_FACTORY_DNS_D);
+        (void)esp_netif_set_dns_info(px_netif, ESP_NETIF_DNS_MAIN, &dns);
+    }
+
+    wifi_config_t w = {0};
+    strlcpy((char *)w.sta.ssid, PX_FACTORY_WIFI_SSID, sizeof(w.sta.ssid));
+    strlcpy((char *)w.sta.password, PX_FACTORY_WIFI_PASSWORD, sizeof(w.sta.password));
+    w.sta.pmf_cfg.capable = true;
+    w.sta.pmf_cfg.required = false;
+    w.sta.threshold.authmode = (PX_FACTORY_WIFI_PASSWORD[0] == '\0') ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
+
+    xEventGroupClearBits(px_wifi_events(), PXWIFI_CONNECTED_BIT | PXWIFI_FAIL_BIT);
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &w));
+
+    esp_err_t c = esp_wifi_connect();
+    if (!(c == ESP_OK || c == ESP_ERR_WIFI_CONN)) {
+        ESP_LOGW(PX_TAG, "Factory Wi-Fi connect start failed: %s", esp_err_to_name(c));
+    }
+
+    EventBits_t bits = xEventGroupWaitBits(
+        px_wifi_events(),
+        PXWIFI_CONNECTED_BIT | PXWIFI_FAIL_BIT,
+        pdFALSE,
+        pdFALSE,
+        pdMS_TO_TICKS(20000)
+    );
+
+    if (bits & PXWIFI_CONNECTED_BIT) {
+        ESP_LOGI(PX_TAG, "Factory Wi-Fi connected. Static setup URL: %s", PX_FACTORY_SETUP_URL);
+        px_factory_web_start();
+    } else {
+        ESP_LOGW(PX_TAG, "Factory Wi-Fi not connected yet. Will keep retrying.");
+    }
+}
+
+static void px_factory_identity_reconnect_if_needed(void)
+{
+    if (!px_factory_identity_mode) return;
+
+    if (px_wifi_is_connected()) {
+        if (!px_factory_httpd) px_factory_web_start();
+        return;
+    }
+
+    uint64_t now = px_nowMs();
+    if (px_factory_last_reconnect_ms != 0 &&
+        (now - px_factory_last_reconnect_ms) < PX_FACTORY_RECONNECT_PERIOD_MS) {
+        return;
+    }
+    px_factory_last_reconnect_ms = now;
+
+    ESP_LOGW(PX_TAG, "Factory Wi-Fi reconnecting...");
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    esp_wifi_connect();
 }
 
 static void px_wifi_stack_ensure_ready(void){
@@ -1053,7 +1691,7 @@ static void px_wifi_stack_ensure_ready(void){
 
 static void px_wifi_disconnect_now(void){
     if (!px_wifi_started) return;
-    xEventGroupClearBits(px_wifi_events(), PXWIFI_CONNECTED_BIT);
+    xEventGroupClearBits(px_wifi_events(), PXWIFI_CONNECTED_BIT | PXWIFI_FAIL_BIT);
     esp_wifi_disconnect();
 }
 
@@ -1061,9 +1699,31 @@ static void px_wifi_reconnect_if_needed(void)
 {
     if (px_is_ble_mode_flag) return;
     if (!px_wifi_started) return;
+
     if (px_wifi_is_connected()) return;
 
     uint64_t now = px_nowMs();
+
+    /*
+     * Associated but not yet IP-ready: wait for GOT_IP. Do NOT set the
+     * PXWIFI_CONNECTED_BIT from esp_wifi_sta_get_ap_info(). The log showed MQTT
+     * DNS starting before GOT_IP, causing getaddrinfo() failures.
+     */
+    wifi_ap_record_t ap_check;
+    if (esp_wifi_sta_get_ap_info(&ap_check) == ESP_OK) {
+        if (px_wifi_associated_ms == 0) px_wifi_associated_ms = now;
+
+        if ((now - px_wifi_associated_ms) < PX_WIFI_WAIT_IP_AFTER_ASSOC_MS) {
+            if (px_wifi_last_wait_ip_log_ms == 0 ||
+                (now - px_wifi_last_wait_ip_log_ms) >= PX_WIFI_IP_WAIT_LOG_PERIOD_MS) {
+                px_wifi_last_wait_ip_log_ms = now;
+                ESP_LOGI(PX_TAG, "Wi-Fi associated but IP not ready yet; waiting for GOT_IP");
+            }
+            return;
+        }
+
+        ESP_LOGW(PX_TAG, "Wi-Fi associated but no IP for too long -> reconnecting");
+    }
 
     if (px_last_wifi_reconnect_ms != 0 &&
         (now - px_last_wifi_reconnect_ms) < PX_WIFI_RECONNECT_PERIOD_MS) {
@@ -1072,27 +1732,11 @@ static void px_wifi_reconnect_if_needed(void)
 
     px_last_wifi_reconnect_ms = now;
 
-    ESP_LOGW(PX_TAG, "Wi-Fi not connected -> recovery reconnect. last_reason=%ld net_fault=%d",
+    ESP_LOGW(PX_TAG, "Wi-Fi not connected -> reconnect. last_reason=%ld net_fault=%d",
              (long)px_last_wifi_disconnect_reason, (int)px_last_net_fault);
 
     esp_wifi_disconnect();
     vTaskDelay(pdMS_TO_TICKS(100));
-
-    /*
-     * If the previous loss was beacon timeout/AP loss, do not blindly reconnect
-     * to a stale BSSID. Scan the same SSID and select the strongest AP first.
-     * This makes roaming/recovery intelligent for homes with multiple APs.
-     */
-    bool should_reselect_ap = G.wifi_roaming_enable &&
-        (px_last_wifi_disconnect_reason == WIFI_REASON_BEACON_TIMEOUT ||
-         px_last_wifi_disconnect_reason == WIFI_REASON_NO_AP_FOUND ||
-         px_last_net_fault == PX_NET_FAULT_WIFI_BEACON_TIMEOUT ||
-         px_last_net_fault == PX_NET_FAULT_WIFI_ROAMING);
-
-    if (should_reselect_ap && !px_wifi_recovery_in_progress) {
-        px_wifi_recovery_in_progress = true;
-        px_wifi_select_best_ap_config(false);
-    }
 
     esp_err_t err = esp_wifi_connect();
 
@@ -1105,6 +1749,7 @@ static void px_wifi_reconnect_if_needed(void)
 
         esp_err_t s = esp_wifi_start();
         if (s == ESP_OK || s == ESP_ERR_WIFI_CONN) {
+            ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
             vTaskDelay(pdMS_TO_TICKS(100));
             esp_wifi_connect();
         }
@@ -1135,40 +1780,73 @@ static void px_wifi_init_and_connect(void){
         }
     }
 
-    wifi_config_t w = {0};
-    strlcpy((char*)w.sta.ssid, ssid, sizeof(w.sta.ssid));
-    strlcpy((char*)w.sta.password, pass, sizeof(w.sta.password));
-    w.sta.threshold.authmode = WIFI_AUTH_OPEN;
-    w.sta.pmf_cfg.capable = true;
-    w.sta.pmf_cfg.required = false;
-
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+
+    wifi_config_t w = {0};
+    px_wifi_build_config_from_ap(&w, ssid, pass, NULL);
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &w));
 
-    xEventGroupClearBits(px_wifi_events(), PXWIFI_CONNECTED_BIT);
+    xEventGroupClearBits(px_wifi_events(), PXWIFI_CONNECTED_BIT | PXWIFI_FAIL_BIT);
     ESP_ERROR_CHECK(esp_wifi_connect());
 
     EventBits_t bits = xEventGroupWaitBits(
         px_wifi_events(),
-        PXWIFI_CONNECTED_BIT,
+        PXWIFI_CONNECTED_BIT | PXWIFI_FAIL_BIT,
         pdFALSE,
         pdFALSE,
         pdMS_TO_TICKS(PX_WIFI_CONNECT_TIMEOUT_MS)
     );
 
     if (!(bits & PXWIFI_CONNECTED_BIT)) {
-        ESP_LOGW(PX_TAG, "Wi-Fi connect timeout");
+        ESP_LOGW(PX_TAG, "Wi-Fi connect timeout or fast-fail");
     } else {
         ESP_LOGI(PX_TAG, "Wi-Fi connected");
     }
 }
 
-static int px_wifi_rssi_now(void){
+static int px_wifi_rssi_raw_now(void)
+{
     wifi_ap_record_t ap;
-    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) return ap.rssi;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        return ap.rssi;
+    }
     return -127;
 }
-int px_wifi_rssi(void){ return px_wifi_rssi_now(); }
+
+static int px_wifi_rssi_avg_now(void)
+{
+    int total = 0;
+    int count = 0;
+
+    for (int i = 0; i < PX_WIFI_RSSI_SAMPLE_COUNT; i++) {
+        int rssi = px_wifi_rssi_raw_now();
+
+        if (rssi > -120 && rssi < 0) {
+            total += rssi;
+            count++;
+        }
+
+        if (i < PX_WIFI_RSSI_SAMPLE_COUNT - 1) {
+            vTaskDelay(pdMS_TO_TICKS(PX_WIFI_RSSI_SAMPLE_DELAY_MS));
+        }
+    }
+
+    if (count == 0) {
+        return -127;
+    }
+
+    return total / count;
+}
+
+static int px_wifi_rssi_now(void)
+{
+    return px_wifi_rssi_avg_now();
+}
+
+int px_wifi_rssi(void)
+{
+    return px_wifi_rssi_avg_now();
+}
 
 // ---------- MQTT ----------
 static void px_mqtt_stop_if_any(void){
@@ -1177,6 +1855,51 @@ static void px_mqtt_stop_if_any(void){
         esp_mqtt_client_destroy(px_mqtt);
         px_mqtt = NULL;
     }
+}
+
+static void px_mqtt_suspend_until_wifi_ready(void)
+{
+    uint64_t now = px_nowMs();
+
+    if (px_wifi_ip_lost_since_ms == 0) {
+        px_wifi_ip_lost_since_ms = now;
+    }
+
+    px_mqtt_suspended_for_wifi = true;
+    px_mqtt_fault_pending_until_ms = 0;
+    px_mqtt_fault_pending_started_ms = 0;
+    /*
+     * Do not destroy MQTT immediately for a short Wi-Fi/IP blip.
+     * This prevents a one-second beacon/DHCP interruption from forcing a full
+     * WSS/TLS client destroy + recreate cycle. esp-mqtt can survive short
+     * network interruptions and reconnect after GOT_IP returns.
+     */
+    if ((now - px_wifi_ip_lost_since_ms) < PX_MQTT_WIFI_SUSPEND_GRACE_MS) {
+        if (px_mqtt) {
+            if (px_current_transport == PX_TRANS_WSS) {
+                px_ws_state = PX_ST_CONNECTING;
+            } else {
+                px_tls_state = PX_ST_CONNECTING;
+            }
+            px_attempt_start_us = px_nowUs();
+        }
+        return;
+    }
+
+    /*
+     * If Wi-Fi/IP is absent for longer than the grace period, stop the MQTT
+     * client cleanly from the service task. After IP_EVENT_STA_GOT_IP, the
+     * service task will create a new WSS client.
+     */
+    if (px_mqtt) {
+        ESP_LOGW(PX_TAG, "Wi-Fi/IP not ready for too long -> suspending MQTT client until GOT_IP");
+        px_mqtt_stop_if_any();
+    }
+
+    px_current_transport = PX_TRANS_WSS;
+    px_ws_state = PX_ST_DISCONNECTED;
+    px_tls_state = PX_ST_DISCONNECTED;
+    px_attempt_start_us = 0;
 }
 
 bool px_mqtt_is_connected(void)
@@ -1212,44 +1935,48 @@ bool px_wait_mqtt_connected(int timeout_ms)
 }
 
 static void px_publish_status(const char* s){
-    if (!px_mqtt) return;
+    if (!px_mqtt_is_connected()) return;
     esp_mqtt_client_publish(px_mqtt, px_topic_status, s, 0, 1, true);
 }
 
 static void px_publish_signal_strength_now(void){
-    if (!px_mqtt) return;
+    if (!px_mqtt_is_connected()) return;
     if (px_ota_update_in_progress_flag) return;
     int r = px_wifi_rssi_now();
 
     cJSON* root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "Signal_Strength", px_signal_label_from_rssi(r));
     char* out = cJSON_PrintUnformatted(root);
-    esp_mqtt_client_publish(px_mqtt, px_topic_tx, out, 0, 1, true);
-    cJSON_free(out);
+    if (out) {
+        esp_mqtt_client_publish(px_mqtt, px_topic_tx, out, 0, 1, true);
+        cJSON_free(out);
+    }
     cJSON_Delete(root);
 }
 
 static void px_publish_wifi_strength_rssi_now(void){
-    if (!px_mqtt) return;
+    if (!px_mqtt_is_connected()) return;
     if (px_ota_update_in_progress_flag) return;
     int r = px_wifi_rssi_now();
 
     cJSON* root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "WiFi_Strength_RSSI", r);
     char* out = cJSON_PrintUnformatted(root);
-    esp_mqtt_client_publish(px_mqtt, px_topic_tx, out, 0, 1, true);
-    cJSON_free(out);
+    if (out) {
+        esp_mqtt_client_publish(px_mqtt, px_topic_tx, out, 0, 1, true);
+        cJSON_free(out);
+    }
     cJSON_Delete(root);
 }
 
 static void px_publish_json_raw(const char* json){
-    if (!px_mqtt || !json) return;
+    if (!px_mqtt_is_connected() || !json) return;
     esp_mqtt_client_publish(px_mqtt, px_topic_tx, json, 0, 1, true);
 }
 
 static void px_publish_firmware_info_now(void)
 {
-    if (!px_mqtt) return;
+    if (!px_mqtt_is_connected()) return;
 
     cJSON *root = cJSON_CreateObject();
     if (!root) return;
@@ -1263,47 +1990,6 @@ static void px_publish_firmware_info_now(void)
 
     if (G.device_type && G.device_type[0]) {
         cJSON_AddStringToObject(root, "Device_Type", G.device_type);
-    }
-
-    cJSON_AddStringToObject(root, "OTA_Mode",
-                            (G.ota_check_on_boot || G.ota_periodic_check_ms > 0)
-                                ? "auto_or_mqtt_controlled"
-                                : "mqtt_controlled");
-
-    px_ota_phase_t phase = px_ota_get_phase();
-    const char *phase_str = "idle";
-    switch (phase) {
-        case PX_OTA_PHASE_CHECKING_VERSION: phase_str = "checking"; break;
-        case PX_OTA_PHASE_UPDATE_AVAILABLE: phase_str = "update_available"; break;
-        case PX_OTA_PHASE_PREPARE_SAFE_STOP: phase_str = "preparing_safe_stop"; break;
-        case PX_OTA_PHASE_SAFE_STOP_CONFIRMED: phase_str = "safe_stop_confirmed"; break;
-        case PX_OTA_PHASE_DOWNLOADING: phase_str = "downloading"; break;
-        case PX_OTA_PHASE_REBOOTING_TO_NEW_APP: phase_str = "rebooting_to_new_app"; break;
-        case PX_OTA_PHASE_FIRST_BOOT_VALIDATION: phase_str = "first_boot_validation"; break;
-        case PX_OTA_PHASE_VALIDATED: phase_str = "validated"; break;
-        case PX_OTA_PHASE_FAILED: phase_str = "failed"; break;
-        case PX_OTA_PHASE_ROLLED_BACK: phase_str = "rolled_back"; break;
-        case PX_OTA_PHASE_IDLE:
-        default: phase_str = "idle"; break;
-    }
-
-    cJSON_AddStringToObject(root, "OTA_Status", phase_str);
-    cJSON_AddBoolToObject(root, "OTA_Update_In_Progress", px_ota_update_in_progress_flag);
-    cJSON_AddBoolToObject(root, "OTA_First_Boot_Validation_Pending", px_ota_pending_verify);
-
-    char target[PX_OTA_TARGET_MAX] = {0};
-    px_nvs_get_strz(PX_KEY_OTA_TARGET, target, sizeof(target));
-    if (target[0]) {
-        cJSON_AddStringToObject(root, "OTA_Target_Version", target);
-    }
-
-    int attempt = px_nvs_get_int(PX_KEY_OTA_ATTEMPT, 0);
-    cJSON_AddNumberToObject(root, "OTA_Attempt_Count", attempt);
-
-    char fail[64] = {0};
-    px_nvs_get_strz(PX_KEY_OTA_FAIL, fail, sizeof(fail));
-    if (fail[0]) {
-        cJSON_AddStringToObject(root, "OTA_Last_Fail_Reason", fail);
     }
 
     char *out = cJSON_PrintUnformatted(root);
@@ -1328,21 +2014,157 @@ static void px_publish_json_internal(const char* json){
     px_publish_json_raw(json);
 }
 
-static void px_publish_ota_status(const char *state, const char *server_version, const char *message) {
+static void px_publish_ota_status(const char *state,
+                                  const char *target_version,
+                                  const char *message)
+{
+    if (!px_mqtt_is_connected()) return;
+
+    const char *safe_state = state ? state : "unknown";
+    const char *safe_target = target_version ? target_version : "";
+    bool progress = px_ota_update_in_progress_flag;
+
+    /*
+     * Do not repeatedly publish the same OTA state.
+     */
+    if (px_last_ota_progress_valid &&
+        strcmp(px_last_ota_state_sent, safe_state) == 0 &&
+        strcmp(px_last_ota_target_sent, safe_target) == 0 &&
+        px_last_ota_progress_sent == progress) {
+        return;
+    }
+
+    strlcpy(px_last_ota_state_sent, safe_state, sizeof(px_last_ota_state_sent));
+    strlcpy(px_last_ota_target_sent, safe_target, sizeof(px_last_ota_target_sent));
+    px_last_ota_progress_sent = progress;
+    px_last_ota_progress_valid = true;
+
     cJSON *root = cJSON_CreateObject();
     if (!root) return;
 
-    cJSON_AddStringToObject(root, "OTA_Status", state ? state : "unknown");
-    cJSON_AddStringToObject(root, "Current_Version", G.firmware_version ? G.firmware_version : "unknown");
-    if (server_version && server_version[0]) cJSON_AddStringToObject(root, "Server_Version", server_version);
-    if (message && message[0]) cJSON_AddStringToObject(root, "OTA_Message", message);
+    cJSON_AddStringToObject(root, "OTA_Status", safe_state);
+    cJSON_AddBoolToObject(root, "OTA_Update_In_Progress", progress);
+
+    if (safe_target[0]) {
+        cJSON_AddStringToObject(root, "OTA_Target_Version", safe_target);
+    }
+
+    /*
+     * Only send error message when OTA failed.
+     * Do not keep sending general OTA_Message.
+     */
+    if (strcmp(safe_state, "failed") == 0 && message && message[0]) {
+        cJSON_AddStringToObject(root, "OTA_Last_Error", message);
+    }
 
     char *out = cJSON_PrintUnformatted(root);
     if (out) {
         px_publish_json_raw(out);
         cJSON_free(out);
     }
+
     cJSON_Delete(root);
+}
+
+// ---------- Small JSON key reader for MQTT control commands ----------
+// ESP32-C3 safety: avoid cJSON_Parse() on RX command payloads because number parsing
+// can enter strtod on RISC-V and crash on some builds. This only checks simple
+// top-level control flags such as {"Device_Reboot":1} or {"OTA_Check":true}.
+static const char *px_json_find_value_ptr(const char *json, const char *key)
+{
+    if (!json || !key || !key[0]) return NULL;
+
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+
+    const char *p = strstr(json, pattern);
+    if (!p) return NULL;
+
+    p += strlen(pattern);
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != ':') return NULL;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    return p;
+}
+
+static bool px_json_key_is_one_or_true(const char *json, const char *key)
+{
+    const char *p = px_json_find_value_ptr(json, key);
+    if (!p) return false;
+
+    if (*p == '1') return true;
+    if (strncmp(p, "true", 4) == 0 || strncmp(p, "TRUE", 4) == 0) return true;
+    if (*p == '"') {
+        p++;
+        if (*p == '1') return true;
+        if (strncmp(p, "true", 4) == 0 || strncmp(p, "TRUE", 4) == 0) return true;
+    }
+
+    return false;
+}
+
+static bool px_json_get_string_value(const char *json, const char *key, char *out, size_t outlen)
+{
+    if (!out || outlen == 0) return false;
+    out[0] = 0;
+
+    const char *p = px_json_find_value_ptr(json, key);
+    if (!p || *p != '"') return false;
+    p++;
+
+    size_t n = 0;
+    bool esc = false;
+    while (*p && n < outlen - 1) {
+        char c = *p++;
+        if (esc) {
+            out[n++] = c;
+            esc = false;
+            continue;
+        }
+        if (c == '\\') {
+            esc = true;
+            continue;
+        }
+        if (c == '"') {
+            out[n] = 0;
+            return true;
+        }
+        out[n++] = c;
+    }
+
+    out[n] = 0;
+    return false;
+}
+
+static bool px_json_get_int_value(const char *json, const char *key, int *out)
+{
+    if (!out) return false;
+    const char *p = px_json_find_value_ptr(json, key);
+    if (!p) return false;
+
+    if (*p == '"') p++;
+
+    int sign = 1;
+    if (*p == '-') {
+        sign = -1;
+        p++;
+    }
+
+    if (*p < '0' || *p > '9') {
+        if (strncmp(p, "true", 4) == 0 || strncmp(p, "TRUE", 4) == 0) { *out = 1; return true; }
+        if (strncmp(p, "false", 5) == 0 || strncmp(p, "FALSE", 5) == 0) { *out = 0; return true; }
+        return false;
+    }
+
+    int v = 0;
+    while (*p >= '0' && *p <= '9') {
+        if (v < 100000000) v = (v * 10) + (*p - '0');
+        p++;
+    }
+
+    *out = v * sign;
+    return true;
 }
 
 static void px_graceful_restart(bool enter_config_mode){
@@ -1434,34 +2256,74 @@ static bool px_ota_parse_version_json(const char *json,
     bin_url_out[0] = 0;
     *force_out = false;
 
-    cJSON *root = cJSON_Parse(json);
-    if (!root) return false;
-
-    cJSON *ver = cJSON_GetObjectItem(root, "version");
-    cJSON *url = cJSON_GetObjectItem(root, "bin_url");
-    cJSON *force = cJSON_GetObjectItem(root, "force");
-
-    if (!cJSON_IsString(url) || !url->valuestring) {
-        url = cJSON_GetObjectItem(root, "firmware_url");
-    }
-
-    if (!cJSON_IsString(ver) || !ver->valuestring ||
-        !cJSON_IsString(url) || !url->valuestring) {
-        cJSON_Delete(root);
+    if (!px_json_get_string_value(json, "version", version_out, version_out_len)) {
         return false;
     }
 
-    strlcpy(version_out, ver->valuestring, version_out_len);
-    strlcpy(bin_url_out, url->valuestring, bin_url_out_len);
-
-    if (cJSON_IsBool(force)) {
-        *force_out = cJSON_IsTrue(force);
-    } else if (cJSON_IsNumber(force)) {
-        *force_out = force->valueint != 0;
+    if (!px_json_get_string_value(json, "bin_url", bin_url_out, bin_url_out_len)) {
+        if (!px_json_get_string_value(json, "firmware_url", bin_url_out, bin_url_out_len)) {
+            return false;
+        }
     }
 
-    cJSON_Delete(root);
+    *force_out = px_json_key_is_one_or_true(json, "force");
+
     return version_out[0] != 0 && px_url_is_https(bin_url_out);
+}
+
+static bool px_ota_metadata_allowed_json(const char *json, const char *server_version)
+{
+    (void)server_version;
+    if (!json) return true;
+
+    char tmp[96] = {0};
+
+    if (G.hardware_model && G.hardware_model[0] &&
+        px_json_get_string_value(json, "hardware", tmp, sizeof(tmp))) {
+        if (strcmp(tmp, G.hardware_model) != 0) {
+            ESP_LOGW(PX_TAG, "OTA rejected: hardware mismatch server=%s device=%s", tmp, G.hardware_model);
+            return false;
+        }
+    }
+
+    tmp[0] = 0;
+    if (G.device_type && G.device_type[0] &&
+        px_json_get_string_value(json, "model", tmp, sizeof(tmp))) {
+        if (strcmp(tmp, G.device_type) != 0) {
+            ESP_LOGW(PX_TAG, "OTA rejected: model mismatch server=%s device=%s", tmp, G.device_type);
+            return false;
+        }
+    }
+
+    tmp[0] = 0;
+    if (G.firmware_version &&
+        px_json_get_string_value(json, "min_current_version", tmp, sizeof(tmp))) {
+        if (px_version_compare(G.firmware_version, tmp) < 0) {
+            ESP_LOGW(PX_TAG, "OTA rejected: current version %s is lower than minimum %s", G.firmware_version, tmp);
+            return false;
+        }
+    }
+
+    int percent = 100;
+    if (px_json_get_int_value(json, "rollout", &percent)) {
+        if (percent < 0) percent = 0;
+        if (percent > 100) percent = 100;
+
+        if (percent < 100 && G.device_serial) {
+            uint32_t h = 2166136261u;
+            for (const char *p = G.device_serial; *p; ++p) {
+                h ^= (uint8_t)(*p);
+                h *= 16777619u;
+            }
+            int bucket = (int)(h % 100u);
+            if (bucket >= percent) {
+                ESP_LOGI(PX_TAG, "OTA rollout skip: bucket=%d rollout=%d", bucket, percent);
+                return false;
+            }
+        }
+    }
+
+    return true;
 }
 
 static esp_err_t px_ota_install_from_url(const char *bin_url) {
@@ -1545,24 +2407,11 @@ static void px_ota_task(void *arg) {
     char server_version[40];
     char bin_url[PX_OTA_URL_MAX];
     bool force_update = false;
-
-    cJSON *meta_root = cJSON_Parse(json);
-    if (!meta_root) {
-        ESP_LOGE(PX_TAG, "OTA version JSON invalid: %s", json);
-        px_ota_set_phase(PX_OTA_PHASE_FAILED);
-        px_nvs_set_str_safe(PX_KEY_OTA_FAIL, "VERSION_JSON_PARSE_FAILED");
-        free(json);
-        px_ota_task_running = false;
-        vTaskDelete(NULL);
-        return;
-    }
-
     if (!px_ota_parse_version_json(json,
                                    server_version, sizeof(server_version),
                                    bin_url, sizeof(bin_url),
                                    &force_update)) {
         ESP_LOGE(PX_TAG, "OTA version JSON missing version/bin_url: %s", json);
-        cJSON_Delete(meta_root);
         free(json);
         px_ota_set_phase(PX_OTA_PHASE_FAILED);
         px_nvs_set_str_safe(PX_KEY_OTA_FAIL, "VERSION_JSON_INVALID");
@@ -1570,7 +2419,6 @@ static void px_ota_task(void *arg) {
         vTaskDelete(NULL);
         return;
     }
-    free(json);
 
     int cmp = px_version_compare(server_version, G.firmware_version);
 
@@ -1580,22 +2428,22 @@ static void px_ota_task(void *arg) {
     if (!force_update && cmp <= 0) {
         ESP_LOGI(PX_TAG, "OTA: firmware is already up to date");
         px_publish_ota_status("up_to_date", server_version, "Firmware is already up to date");
-        cJSON_Delete(meta_root);
+        free(json);
         px_ota_set_phase(PX_OTA_PHASE_IDLE);
         px_ota_task_running = false;
         vTaskDelete(NULL);
         return;
     }
 
-    if (!px_ota_metadata_allowed(meta_root, server_version)) {
+    if (!px_ota_metadata_allowed_json(json, server_version)) {
         px_publish_ota_status("skipped", server_version, "Firmware metadata did not match this device or rollout rule");
-        cJSON_Delete(meta_root);
+        free(json);
         px_ota_set_phase(PX_OTA_PHASE_IDLE);
         px_ota_task_running = false;
         vTaskDelete(NULL);
         return;
     }
-    cJSON_Delete(meta_root);
+    free(json);
 
     if (px_ota_target_attempt_blocked(server_version, force_update)) {
         px_publish_ota_status("blocked", server_version, "This target version failed too many times and is blocked");
@@ -1723,6 +2571,83 @@ void px_ota_check_now(void) {
     px_ota_manual_request = true;
 }
 
+
+static void px_mqtt_transport_connected_note(void)
+{
+    px_mqtt_last_connected_ms = px_nowMs();
+    px_mqtt_transport_fault_count = 0;
+    px_mqtt_transport_fault_window_ms = 0;    px_mqtt_suspended_for_wifi = false;
+    px_mqtt_fault_pending_until_ms = 0;
+    px_mqtt_fault_pending_started_ms = 0;
+}
+
+static void px_mqtt_fault_pending_clear(void)
+{
+    px_mqtt_fault_pending_until_ms = 0;
+    px_mqtt_fault_pending_started_ms = 0;
+}
+
+static void px_mqtt_transport_fault_note(bool wifi_root_fault)
+{
+    uint64_t now = px_nowMs();
+    px_mqtt_last_fault_ms = now;
+
+    if (wifi_root_fault) {
+        /* Do not count MQTT errors caused by Wi-Fi loss as MQTT faults. */
+        return;
+    }
+
+    if (px_mqtt_transport_fault_window_ms == 0 ||
+        (now - px_mqtt_transport_fault_window_ms) > PX_MQTT_FAULT_WINDOW_MS) {
+        px_mqtt_transport_fault_window_ms = now;
+        px_mqtt_transport_fault_count = 1;
+    } else {
+        if (px_mqtt_transport_fault_count < 100) px_mqtt_transport_fault_count++;
+    }
+}
+
+static void px_mqtt_fault_deferred_check(void)
+{
+    if (px_mqtt_fault_pending_until_ms == 0) return;
+
+    uint64_t now = px_nowMs();
+
+    /*
+     * If Wi-Fi drops shortly after the MQTT event, the MQTT error was only a
+     * symptom of beacon timeout/AP loss. Do not count it as an MQTT fault.
+     */
+    if (px_mqtt_suspended_for_wifi ||
+        !px_wifi_is_connected() ||
+        (px_last_wifi_disconnect_ms != 0 &&
+         (now - px_last_wifi_disconnect_ms) < PX_WIFI_RECENT_LOSS_CLASSIFY_MS)) {
+        ESP_LOGW(PX_TAG,
+                 "Deferred MQTT fault resolved as Wi-Fi root fault. last_reason=%ld",
+                 (long)px_last_wifi_disconnect_reason);
+        px_mqtt_transport_fault_note(true);
+        px_mqtt_fault_pending_clear();
+        return;
+    }
+
+    if (now < px_mqtt_fault_pending_until_ms) return;
+
+    if (px_mqtt_is_connected()) {
+        ESP_LOGI(PX_TAG, "Deferred MQTT fault cleared; MQTT reconnected while Wi-Fi stayed ready");
+        px_mqtt_fault_pending_clear();
+        return;
+    }
+
+    /*
+     * Wi-Fi remained IP-ready throughout the hold window and MQTT did not
+     * recover, so only now it is a true MQTT/WSS transport fault.
+     */
+    px_last_net_fault = PX_NET_FAULT_MQTT_TRANSPORT;
+    px_mqtt_transport_fault_note(false);
+    ESP_LOGW(PX_TAG,
+             "MQTT/WSS fault confirmed after Wi-Fi stayed IP-ready for %d ms",
+             PX_MQTT_FAULT_CLASSIFY_DELAY_MS);
+    px_mqtt_fault_pending_clear();
+}
+
 static esp_err_t px_mqtt_event_handler_cb(esp_mqtt_event_handle_t e){
     switch (e->event_id){
     case MQTT_EVENT_CONNECTED:
@@ -1731,6 +2656,7 @@ static esp_err_t px_mqtt_event_handler_cb(esp_mqtt_event_handle_t e){
     } else {
         px_tls_state = PX_ST_CONNECTED;
     }
+    px_mqtt_transport_connected_note();
 
     /*
      * Critical startup data.
@@ -1751,20 +2677,72 @@ static esp_err_t px_mqtt_event_handler_cb(esp_mqtt_event_handle_t e){
     esp_mqtt_client_subscribe(px_mqtt, px_topic_rx, 1);
     break;
 
-    case MQTT_EVENT_DISCONNECTED:
-    case MQTT_EVENT_ERROR:
-        if (px_current_transport==PX_TRANS_WSS) px_ws_state = PX_ST_DISCONNECTED;
-        else px_tls_state = PX_ST_DISCONNECTED;
+    case MQTT_EVENT_ERROR: {
+        uint64_t now = px_nowMs();
         px_ota_online_stable_since_ms = 0;
 
-        if (!px_wifi_is_connected() || px_nowMs() < px_mqtt_wifi_fault_suppress_until_ms) {
-            ESP_LOGW(PX_TAG, "MQTT transport lost because Wi-Fi is down/recovering; root fault is Wi-Fi, last_reason=%ld",
+        bool recent_wifi_loss = (px_last_wifi_disconnect_ms != 0 &&
+                                 (now - px_last_wifi_disconnect_ms) < PX_WIFI_RECENT_LOSS_CLASSIFY_MS);
+
+        if (px_mqtt_suspended_for_wifi ||
+            !px_wifi_is_connected() ||
+            now < px_mqtt_wifi_fault_suppress_until_ms ||
+            recent_wifi_loss) {
+            px_mqtt_transport_fault_note(true);
+            px_mqtt_fault_pending_clear();
+            ESP_LOGW(PX_TAG,
+                     "MQTT error during Wi-Fi recovery; treating root cause as Wi-Fi, last_reason=%ld",
                      (long)px_last_wifi_disconnect_reason);
         } else {
-            px_last_net_fault = PX_NET_FAULT_MQTT_TRANSPORT;
-            ESP_LOGW(PX_TAG, "MQTT root fault: transport disconnected while Wi-Fi is still connected");
+            /*
+             * MQTT_EVENT_ERROR alone is not always a completed disconnect.
+             * Keep the client under esp-mqtt reconnect control and only delay
+             * classification. Refresh the pending window on every new error.
+             */
+            px_mqtt_fault_pending_started_ms = now;
+            px_mqtt_fault_pending_until_ms = now + PX_MQTT_FAULT_CLASSIFY_DELAY_MS;
+            ESP_LOGW(PX_TAG,
+                     "MQTT transport error while Wi-Fi has IP; delaying classification");
         }
         break;
+    }
+
+    case MQTT_EVENT_DISCONNECTED: {
+        /* esp-mqtt auto reconnect remains active. Keep state as CONNECTING. */
+        if (px_current_transport == PX_TRANS_WSS) {
+            px_ws_state = PX_ST_CONNECTING;
+        } else {
+            px_tls_state = PX_ST_CONNECTING;
+        }
+        px_attempt_start_us = px_nowUs();
+        px_ota_online_stable_since_ms = 0;
+
+        uint64_t now = px_nowMs();
+        bool recent_wifi_loss = (px_last_wifi_disconnect_ms != 0 &&
+                                 (now - px_last_wifi_disconnect_ms) < PX_WIFI_RECENT_LOSS_CLASSIFY_MS);
+
+        if (px_mqtt_suspended_for_wifi ||
+            !px_wifi_is_connected() ||
+            now < px_mqtt_wifi_fault_suppress_until_ms ||
+            recent_wifi_loss) {
+            px_mqtt_transport_fault_note(true);
+            px_mqtt_fault_pending_clear();
+            ESP_LOGW(PX_TAG,
+                     "MQTT disconnected because Wi-Fi is down/recovering; root fault is Wi-Fi, last_reason=%ld",
+                     (long)px_last_wifi_disconnect_reason);
+        } else {
+            /*
+             * Wi-Fi still has IP, but WSS may need more than a few seconds to
+             * reconnect. Refresh the hold window instead of counting this as an
+             * immediate MQTT fault.
+             */
+            px_mqtt_fault_pending_started_ms = now;
+            px_mqtt_fault_pending_until_ms = now + PX_MQTT_FAULT_CLASSIFY_DELAY_MS;
+            ESP_LOGW(PX_TAG,
+                     "MQTT disconnected while Wi-Fi still has IP; holding classification");
+        }
+        break;
+    }
 
     case MQTT_EVENT_DATA: {
         int tlen = e->topic_len;
@@ -1785,55 +2763,32 @@ static esp_err_t px_mqtt_event_handler_cb(esp_mqtt_event_handle_t e){
             tlen == (int)strlen(px_topic_rx) &&
             strncmp(topic, px_topic_rx, tlen) == 0) {
 
-            cJSON* root = cJSON_Parse(payload);
-            if (root){
-                cJSON* reboot = cJSON_GetObjectItem(root, "Device_Reboot");
-                if (cJSON_IsNumber(reboot) && reboot->valueint == 1){
-                    cJSON_Delete(root);
-                    free(topic); free(payload);
-                    px_graceful_restart(false);
-                    return ESP_OK;
-                }
+            // ESP32-C3-safe MQTT control parsing: no cJSON_Parse() here.
+            if (px_json_key_is_one_or_true(payload, "Device_Reboot")) {
+                free(topic); free(payload);
+                px_graceful_restart(false);
+                return ESP_OK;
+            }
 
-                cJSON* reset = cJSON_GetObjectItem(root, "Device_Reset");
-                if (cJSON_IsNumber(reset) && reset->valueint == 1){
-                    cJSON_Delete(root);
-                    free(topic); free(payload);
-                    px_graceful_restart(true);
-                    return ESP_OK;
-                }
+            if (px_json_key_is_one_or_true(payload, "Device_Reset")) {
+                free(topic); free(payload);
+                px_graceful_restart(true);
+                return ESP_OK;
+            }
 
-                cJSON* fw_info = cJSON_GetObjectItem(root, "Firmware_Info");
-                if ((cJSON_IsNumber(fw_info) && fw_info->valueint == 1) ||
-                    (cJSON_IsBool(fw_info) && cJSON_IsTrue(fw_info))) {
-                    ESP_LOGI(PX_TAG, "Firmware info requested by MQTT");
-                    px_publish_firmware_info_now();
-                    cJSON_Delete(root);
-                    free(topic); free(payload);
-                    return ESP_OK;
-                }
+            if (px_json_key_is_one_or_true(payload, "Firmware_Info")) {
+                ESP_LOGI(PX_TAG, "Firmware info requested by MQTT");
+                px_publish_firmware_info_now();
+                free(topic); free(payload);
+                return ESP_OK;
+            }
 
-                cJSON* fw = cJSON_GetObjectItem(root, "Firmware_Update");
-                if ((cJSON_IsNumber(fw) && fw->valueint == 1) ||
-                    (cJSON_IsBool(fw) && cJSON_IsTrue(fw))) {
-                    ESP_LOGI(PX_TAG, "Manual OTA check requested by MQTT");
-                    px_ota_check_now();
-                    cJSON_Delete(root);
-                    free(topic); free(payload);
-                    return ESP_OK;
-                }
-
-                cJSON* ota_check = cJSON_GetObjectItem(root, "OTA_Check");
-                if ((cJSON_IsNumber(ota_check) && ota_check->valueint == 1) ||
-                    (cJSON_IsBool(ota_check) && cJSON_IsTrue(ota_check))) {
-                    ESP_LOGI(PX_TAG, "Manual OTA check requested by MQTT");
-                    px_ota_check_now();
-                    cJSON_Delete(root);
-                    free(topic); free(payload);
-                    return ESP_OK;
-                }
-
-                cJSON_Delete(root);
+            if (px_json_key_is_one_or_true(payload, "Firmware_Update") ||
+                px_json_key_is_one_or_true(payload, "OTA_Check")) {
+                ESP_LOGI(PX_TAG, "Manual OTA check requested by MQTT");
+                px_ota_check_now();
+                free(topic); free(payload);
+                return ESP_OK;
             }
 
             if (px_user_msg_cb) px_user_msg_cb(px_topic_rx, payload);
@@ -1857,18 +2812,22 @@ static void px_mqtt_event_handler(void* a, esp_event_base_t b, int32_t id, void*
 
 static void px_mqtt_try_once_wss(void){
     if (!px_wifi_is_connected()) {
-        ESP_LOGW(PX_TAG, "MQTT WSS skipped: Wi-Fi not connected");
+        ESP_LOGW(PX_TAG, "MQTT WSS skipped: Wi-Fi/GOT_IP not ready");
         return;
     }
 
+    px_mqtt_suspended_for_wifi = false;
+
+    ESP_LOGI(PX_TAG, "MQTT WSS connect start: keepalive=%ds timeout=%dms", PX_KEEPALIVE_SEC, PX_MQTT_CONNECT_TIMEOUT_MS);
     px_mqtt_stop_if_any();
     esp_mqtt_client_config_t cfg = {0};
     cfg.broker.address.uri = G.mqtt_wss_uri;
     cfg.broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
     cfg.session.keepalive = PX_KEEPALIVE_SEC;
-    cfg.network.timeout_ms = 10000;
-    cfg.network.disable_auto_reconnect = true;
-    cfg.credentials.client_id = G.device_serial;
+    cfg.network.timeout_ms = PX_MQTT_CONNECT_TIMEOUT_MS;
+    cfg.network.reconnect_timeout_ms = PX_MQTT_RECONNECT_TIMEOUT_MS;
+    cfg.network.disable_auto_reconnect = false;
+    cfg.credentials.client_id = px_mqtt_client_id[0] ? px_mqtt_client_id : G.device_serial;
     cfg.credentials.username  = G.device_serial;
     cfg.credentials.authentication.password = G.auth_number;
 
@@ -1879,60 +2838,36 @@ static void px_mqtt_try_once_wss(void){
     cfg.session.last_will.retain = true;
 
     px_mqtt = esp_mqtt_client_init(&cfg);
-    esp_mqtt_client_register_event(px_mqtt, MQTT_EVENT_ANY, px_mqtt_event_handler, NULL);
-    ESP_ERROR_CHECK(esp_mqtt_client_start(px_mqtt));
-    px_ws_state = PX_ST_CONNECTING;
-    px_attempt_start_us = px_nowUs();
-}
-
-static void px_mqtt_try_once_tls(void){
-    if (!px_wifi_is_connected()) {
-        ESP_LOGW(PX_TAG, "MQTT TLS skipped: Wi-Fi not connected");
+    if (!px_mqtt) {
+        ESP_LOGE(PX_TAG, "esp_mqtt_client_init failed for WSS");
+        px_ws_state = PX_ST_DISCONNECTED;
         return;
     }
-
-    px_mqtt_stop_if_any();
-    char uri[128];
-    snprintf(uri, sizeof(uri), "mqtts://%s:%d", G.mqtt_host, G.mqtt_tls_port);
-
-    esp_mqtt_client_config_t cfg = {0};
-    cfg.broker.address.uri = uri;
-    cfg.broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
-    cfg.session.keepalive = PX_KEEPALIVE_SEC;
-    cfg.network.timeout_ms = 10000;
-    cfg.network.disable_auto_reconnect = true;
-    cfg.credentials.client_id = G.device_serial;
-    cfg.credentials.username  = G.device_serial;
-    cfg.credentials.authentication.password = G.auth_number;
-
-    static const char will_payload[]="offline";
-    cfg.session.last_will.topic  = px_topic_status;
-    cfg.session.last_will.msg    = will_payload;
-    cfg.session.last_will.qos    = 1;
-    cfg.session.last_will.retain = true;
-
-    px_mqtt = esp_mqtt_client_init(&cfg);
     esp_mqtt_client_register_event(px_mqtt, MQTT_EVENT_ANY, px_mqtt_event_handler, NULL);
-    ESP_ERROR_CHECK(esp_mqtt_client_start(px_mqtt));
-    px_tls_state = PX_ST_CONNECTING;
+    px_ws_state = PX_ST_CONNECTING;
     px_attempt_start_us = px_nowUs();
+    esp_err_t start_err = esp_mqtt_client_start(px_mqtt);
+    if (start_err != ESP_OK) {
+        ESP_LOGE(PX_TAG, "esp_mqtt_client_start WSS failed: %s", esp_err_to_name(start_err));
+        esp_mqtt_client_destroy(px_mqtt);
+        px_mqtt = NULL;
+        px_ws_state = PX_ST_DISCONNECTED;
+    }
 }
 
-static void px_flip_transport(void){
+
+static void px_restart_wss_transport(void){
+    /*
+     * WSS-only policy:
+     * Do not flip to native MQTT TLS. Some customer/firewall networks only allow
+     * WebSocket HTTPS paths, and the product requirement is WSS only.
+     */
     px_last_flip_us = px_nowUs();
-    if (px_current_transport==PX_TRANS_WSS){
-        px_mqtt_stop_if_any();
-        px_ws_state = PX_ST_DISCONNECTED;
-        px_current_transport = PX_TRANS_TLS;
-        px_tls_state = PX_ST_DISCONNECTED;
-        px_mqtt_try_once_tls();
-    } else {
-        px_mqtt_stop_if_any();
-        px_tls_state = PX_ST_DISCONNECTED;
-        px_current_transport = PX_TRANS_WSS;
-        px_ws_state = PX_ST_DISCONNECTED;
-        px_mqtt_try_once_wss();
-    }
+    px_mqtt_stop_if_any();
+    px_current_transport = PX_TRANS_WSS;
+    px_ws_state = PX_ST_DISCONNECTED;
+    px_tls_state = PX_ST_DISCONNECTED;
+    px_mqtt_try_once_wss();
 }
 
 // ---------- BLE UUIDs ----------
@@ -1956,29 +2891,6 @@ static void px_set_static_random_addr(void) {
     px_own_addr_type = BLE_OWN_ADDR_RANDOM;
 }
 
-// ---------- Provisioning parsing ----------
-static bool px_extract_string_any(cJSON* root, const char* k1, const char* k2, char* out, size_t outlen){
-    if (!root || !out || outlen == 0) return false;
-    cJSON* a = k1 ? cJSON_GetObjectItem(root, k1) : NULL;
-    cJSON* b = k2 ? cJSON_GetObjectItem(root, k2) : NULL;
-
-    if (cJSON_IsString(a) && a->valuestring) {
-        strlcpy(out, a->valuestring, outlen);
-        return true;
-    }
-    if (cJSON_IsString(b) && b->valuestring) {
-        strlcpy(out, b->valuestring, outlen);
-        return true;
-    }
-    return false;
-}
-
-static int px_extract_req_id(cJSON* root){
-    if (!root) return -1;
-    cJSON* reqId = cJSON_GetObjectItem(root, "reqId");
-    if (cJSON_IsNumber(reqId)) return reqId->valueint;
-    return -1;
-}
 
 static bool px_enqueue_prov_cmd(const px_prov_cmd_t* cmd){
     if (!px_prov_queue || !cmd) return false;
@@ -2156,6 +3068,285 @@ static void px_prov_worker_task(void* arg){
     }
 }
 
+// ---------- BLE provisioning JSON parser ----------
+/*
+ * ESP32-C3 note:
+ * Do not use cJSON_Parse() for the BLE provisioning command path.
+ * On the affected ESP32-C3/ESP-IDF build, the tiny payload
+ * {"cmd":"scan_wifi","reqId":1} crashes inside newlib strtod(), which is
+ * called by cJSON when it parses numeric values.  For BLE provisioning we only need a few
+ * simple fields, so we parse them with a small safe extractor instead.
+ */
+static const char *px_ble_json_skip_ws(const char *p)
+{
+    while (p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+    return p;
+}
+
+static const char *px_ble_json_find_value(const char *json, const char *key)
+{
+    if (!json || !key || !key[0]) return NULL;
+
+    const char *p = json;
+    size_t key_len = strlen(key);
+
+    while (*p) {
+        p = strchr(p, '"');
+        if (!p) return NULL;
+        p++;
+
+        const char *kstart = p;
+        bool esc = false;
+
+        while (*p) {
+            if (esc) {
+                esc = false;
+                p++;
+                continue;
+            }
+            if (*p == '\\') {
+                esc = true;
+                p++;
+                continue;
+            }
+            if (*p == '"') break;
+            p++;
+        }
+
+        if (!*p) return NULL;
+
+        size_t got_len = (size_t)(p - kstart);
+        bool key_match = (got_len == key_len && strncmp(kstart, key, key_len) == 0);
+
+        p++; /* after closing quote */
+        p = px_ble_json_skip_ws(p);
+
+        if (key_match && *p == ':') {
+            p++;
+            return px_ble_json_skip_ws(p);
+        }
+
+        /* Not the requested key. Continue scanning. */
+    }
+
+    return NULL;
+}
+
+static bool px_ble_json_get_string_one(const char *json, const char *key, char *out, size_t outlen)
+{
+    if (!out || outlen == 0) return false;
+    out[0] = '\0';
+
+    const char *p = px_ble_json_find_value(json, key);
+    if (!p || *p != '"') return false;
+
+    p++; /* after opening quote */
+    size_t n = 0;
+    bool esc = false;
+
+    while (*p) {
+        char c = *p++;
+
+        if (esc) {
+            esc = false;
+            switch (c) {
+                case 'n': c = '\n'; break;
+                case 'r': c = '\r'; break;
+                case 't': c = '\t'; break;
+                case '"': c = '"'; break;
+                case '\\': c = '\\'; break;
+                case '/': c = '/'; break;
+                default: break;
+            }
+        } else {
+            if (c == '\\') {
+                esc = true;
+                continue;
+            }
+            if (c == '"') {
+                out[n] = '\0';
+                return true;
+            }
+        }
+
+        if (n + 1 < outlen) {
+            out[n++] = c;
+        }
+    }
+
+    out[n] = '\0';
+    return false;
+}
+
+static bool px_ble_json_get_string_any(const char *json,
+                                       const char *k1,
+                                       const char *k2,
+                                       char *out,
+                                       size_t outlen)
+{
+    if (k1 && px_ble_json_get_string_one(json, k1, out, outlen)) return true;
+    if (k2 && px_ble_json_get_string_one(json, k2, out, outlen)) return true;
+    if (out && outlen) out[0] = '\0';
+    return false;
+}
+
+static int px_ble_json_get_req_id_no_cjson(const char *json)
+{
+    const char *p = px_ble_json_find_value(json, "reqId");
+    if (!p) return -1;
+
+    p = px_ble_json_skip_ws(p);
+
+    if (*p == '"') {
+        p++;
+    }
+
+    bool neg = false;
+    if (*p == '-') {
+        neg = true;
+        p++;
+    }
+
+    int value = 0;
+    bool any = false;
+
+    while (*p >= '0' && *p <= '9') {
+        any = true;
+        if (value < 100000000) {
+            value = (value * 10) + (*p - '0');
+        }
+        p++;
+    }
+
+    if (!any) return -1;
+    return neg ? -value : value;
+}
+
+static void px_ble_parse_and_enqueue_prov_json(const char *json)
+{
+    if (!json || json[0] == '\0') {
+        px_status_publish_error("EMPTY_PAYLOAD", "Provisioning payload is empty", -1);
+        return;
+    }
+
+    px_prov_cmd_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.req_id = px_ble_json_get_req_id_no_cjson(json);
+
+    char cmd_name[32] = {0};
+    bool has_cmd = px_ble_json_get_string_one(json, "cmd", cmd_name, sizeof(cmd_name));
+
+    if (has_cmd && cmd_name[0]) {
+        if (strcmp(cmd_name, "scan_wifi") == 0) {
+            cmd.type = PX_PROV_CMD_SCAN_WIFI;
+        } else if (strcmp(cmd_name, "commit_wifi") == 0) {
+            cmd.type = PX_PROV_CMD_COMMIT_WIFI;
+        } else if (strcmp(cmd_name, "resend_status") == 0 ||
+                   strcmp(cmd_name, "get_status") == 0) {
+            cmd.type = PX_PROV_CMD_RESEND_STATUS;
+        } else if (strcmp(cmd_name, "set_wifi") == 0) {
+            cmd.type = PX_PROV_CMD_SET_WIFI;
+
+            if (!px_ble_json_get_string_any(json, "ssid", "SSID", cmd.ssid, sizeof(cmd.ssid))) {
+                px_status_publish_error("MISSING_SSID", "SSID is missing", cmd.req_id);
+                return;
+            }
+
+            px_ble_json_get_string_any(json, "password", "Password", cmd.pass, sizeof(cmd.pass));
+        } else {
+            px_status_publish_error("UNKNOWN_CMD", "Unknown provisioning command", cmd.req_id);
+            return;
+        }
+    } else {
+        /* Backward compatibility with older phone-side payloads:
+         * {"ssid":"...","password":"..."} without a cmd field.
+         */
+        if (!px_ble_json_get_string_any(json, "ssid", "SSID", cmd.ssid, sizeof(cmd.ssid))) {
+            px_status_publish_error("MISSING_SSID", "SSID is missing", cmd.req_id);
+            return;
+        }
+
+        px_ble_json_get_string_any(json, "password", "Password", cmd.pass, sizeof(cmd.pass));
+        cmd.type = PX_PROV_CMD_SET_WIFI;
+    }
+
+    ESP_LOGI(PX_TAG, "BLE provision command parsed without cJSON: cmd=%d reqId=%d ssid=%s",
+             (int)cmd.type, cmd.req_id, cmd.ssid[0] ? cmd.ssid : "-");
+
+    if (!px_enqueue_prov_cmd(&cmd)) {
+        px_status_publish_error("BUSY", "Provisioning worker is busy", cmd.req_id);
+    }
+}
+
+static void px_ble_json_worker_task(void *arg)
+{
+    (void)arg;
+    px_ble_json_msg_t msg;
+
+    while (1) {
+        if (xQueueReceive(px_ble_json_queue, &msg, portMAX_DELAY) == pdTRUE) {
+            msg.json[sizeof(msg.json) - 1] = '\0';
+            px_ble_parse_and_enqueue_prov_json(msg.json);
+        }
+    }
+}
+
+static void px_ble_json_worker_start_once(void)
+{
+    if (!px_ble_json_queue) {
+        px_ble_json_queue = xQueueCreate(6, sizeof(px_ble_json_msg_t));
+        if (!px_ble_json_queue) {
+            ESP_LOGE(PX_TAG, "Failed to create BLE JSON queue");
+            abort();
+        }
+    }
+
+    if (!px_ble_json_task_handle) {
+        BaseType_t ok = xTaskCreatePinnedToCore(
+            px_ble_json_worker_task,
+            "px_ble_json_worker",
+            8192,
+            NULL,
+            5,
+            &px_ble_json_task_handle,
+            tskNO_AFFINITY
+        );
+
+        if (ok != pdPASS) {
+            ESP_LOGE(PX_TAG, "Failed to create BLE JSON worker task");
+            px_ble_json_task_handle = NULL;
+            abort();
+        }
+    }
+}
+
+static bool px_ble_queue_completed_json_from_accumulator(void)
+{
+    if (!px_ble_json_queue) {
+        px_status_publish_error("BLE_QUEUE_NOT_READY", "BLE JSON queue is not ready", -1);
+        return false;
+    }
+
+    px_ble_json_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+
+    if (px_wifi_len >= sizeof(msg.json)) {
+        px_status_publish_error("PAYLOAD_OVERFLOW", "Provisioning payload overflow", -1);
+        return false;
+    }
+
+    msg.len = (uint16_t)px_wifi_len;
+    memcpy(msg.json, px_wifi_buf, px_wifi_len);
+    msg.json[px_wifi_len] = '\0';
+
+    if (xQueueSend(px_ble_json_queue, &msg, 0) != pdTRUE) {
+        px_status_publish_error("BUSY", "BLE JSON worker is busy", -1);
+        return false;
+    }
+
+    return true;
+}
+
 // ---------- GATT callback ----------
 static int px_gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                              struct ble_gatt_access_ctxt *ctxt, void *arg)
@@ -2164,50 +3355,90 @@ static int px_gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     (void)attr_handle;
     (void)arg;
 
-    if (!ctxt || !ctxt->chr || !ctxt->chr->uuid) return BLE_ATT_ERR_UNLIKELY;
+    if (!ctxt || !ctxt->chr || !ctxt->chr->uuid) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
 
-    if (ble_uuid_cmp(ctxt->chr->uuid, &PX_DEVINFO_UUID.u) == 0){
-        if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR){
+    if (ble_uuid_cmp(ctxt->chr->uuid, &PX_DEVINFO_UUID.u) == 0) {
+        if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
             cJSON* root = cJSON_CreateObject();
+            if (!root) {
+                return BLE_ATT_ERR_INSUFFICIENT_RES;
+            }
+
             cJSON_AddStringToObject(root, "deviceSerialNumber", G.device_serial ? G.device_serial : "");
             cJSON_AddStringToObject(root, "authToken", G.auth_number ? G.auth_number : "");
-            if (G.firmware_version) cJSON_AddStringToObject(root, "firmwareVersion", G.firmware_version);
+
+            if (G.firmware_version) {
+                cJSON_AddStringToObject(root, "firmwareVersion", G.firmware_version);
+            }
+
             char* full = cJSON_PrintUnformatted(root);
 
-            size_t total = strlen(full);
-            size_t off = ctxt->offset;
-            if (off < total) os_mbuf_append(ctxt->om, full + off, total - off);
+            if (full) {
+                size_t total = strlen(full);
+                size_t off = ctxt->offset;
+                if (off < total) {
+                    int rc = os_mbuf_append(ctxt->om, full + off, total - off);
+                    cJSON_free(full);
+                    cJSON_Delete(root);
+                    return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+                }
+                cJSON_free(full);
+            }
 
-            cJSON_free(full);
             cJSON_Delete(root);
             return 0;
         }
+
         return BLE_ATT_ERR_REQ_NOT_SUPPORTED;
     }
 
-    if (ble_uuid_cmp(ctxt->chr->uuid, &PX_STATUS_UUID.u) == 0){
-        if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR){
+    if (ble_uuid_cmp(ctxt->chr->uuid, &PX_STATUS_UUID.u) == 0) {
+        if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
             px_status_build_current_txn();
             size_t total = strlen(px_status_json);
             size_t off = ctxt->offset;
-            if (off < total) os_mbuf_append(ctxt->om, px_status_json + off, total - off);
+            if (off < total) {
+                int rc = os_mbuf_append(ctxt->om, px_status_json + off, total - off);
+                return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+            }
             return 0;
         }
+
         return BLE_ATT_ERR_REQ_NOT_SUPPORTED;
     }
 
-    if (ble_uuid_cmp(ctxt->chr->uuid, &PX_WIFI_UUID.u) == 0){
-        if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR){
-            uint16_t plen = OS_MBUF_PKTLEN(ctxt->om);
-            if (plen == 0) return 0;
+    if (ble_uuid_cmp(ctxt->chr->uuid, &PX_WIFI_UUID.u) == 0) {
+        if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+            if (!ctxt->om) {
+                px_status_publish_error("EMPTY_PAYLOAD", "BLE write buffer is missing", -1);
+                return BLE_ATT_ERR_UNLIKELY;
+            }
 
+            uint16_t plen = OS_MBUF_PKTLEN(ctxt->om);
+            if (plen == 0) {
+                return 0;
+            }
+
+            /*
+             * ESP32-C3 safe BLE method:
+             * Keep the working-code approach: copy each BLE chunk into a small
+             * local buffer, append it into px_wifi_buf, wait until the full JSON
+             * object is complete, then pass it to a normal FreeRTOS task.
+             * No cJSON parsing is done inside the NimBLE GATT callback.
+             */
             uint8_t tmp[256];
             if (plen > sizeof(tmp)) {
                 px_status_publish_error("PAYLOAD_TOO_LARGE", "BLE payload chunk too large", -1);
                 return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
             }
 
-            os_mbuf_copydata(ctxt->om, 0, plen, tmp);
+            int rc = os_mbuf_copydata(ctxt->om, 0, plen, tmp);
+            if (rc != 0) {
+                px_status_publish_error("MBUF_COPY_FAILED", "BLE payload copy failed", -1);
+                return BLE_ATT_ERR_UNLIKELY;
+            }
 
             if (!px_wifi_accum_add(tmp, plen)) {
                 px_wifi_accum_reset();
@@ -2219,66 +3450,12 @@ static int px_gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                 return 0;
             }
 
-            cJSON* root = cJSON_Parse(px_wifi_buf);
-            if (!root){
-                px_status_publish_error("INVALID_JSON", "Provisioning JSON parse failed", -1);
-                px_wifi_accum_reset();
-                return BLE_ATT_ERR_UNLIKELY;
-            }
-
-            px_prov_cmd_t cmd;
-            memset(&cmd, 0, sizeof(cmd));
-            cmd.req_id = px_extract_req_id(root);
-
-            cJSON* jcmd = cJSON_GetObjectItem(root, "cmd");
-
-            if (cJSON_IsString(jcmd) && jcmd->valuestring) {
-                if (strcmp(jcmd->valuestring, "scan_wifi") == 0) {
-                    cmd.type = PX_PROV_CMD_SCAN_WIFI;
-                } else if (strcmp(jcmd->valuestring, "commit_wifi") == 0) {
-                    cmd.type = PX_PROV_CMD_COMMIT_WIFI;
-                } else if (strcmp(jcmd->valuestring, "resend_status") == 0 ||
-                           strcmp(jcmd->valuestring, "get_status") == 0) {
-                    cmd.type = PX_PROV_CMD_RESEND_STATUS;
-                } else if (strcmp(jcmd->valuestring, "set_wifi") == 0) {
-                    cmd.type = PX_PROV_CMD_SET_WIFI;
-
-                    if (!px_extract_string_any(root, "ssid", "SSID", cmd.ssid, sizeof(cmd.ssid))) {
-                        cJSON_Delete(root);
-                        px_wifi_accum_reset();
-                        px_status_publish_error("MISSING_SSID", "SSID is missing", cmd.req_id);
-                        return 0;
-                    }
-
-                    px_extract_string_any(root, "password", "Password", cmd.pass, sizeof(cmd.pass));
-                } else {
-                    cJSON_Delete(root);
-                    px_wifi_accum_reset();
-                    px_status_publish_error("UNKNOWN_CMD", "Unknown provisioning command", cmd.req_id);
-                    return BLE_ATT_ERR_UNLIKELY;
-                }
-            } else {
-                cmd.type = PX_PROV_CMD_SET_WIFI;
-
-                if (!px_extract_string_any(root, "ssid", "SSID", cmd.ssid, sizeof(cmd.ssid))) {
-                    cJSON_Delete(root);
-                    px_wifi_accum_reset();
-                    px_status_publish_error("MISSING_SSID", "SSID is missing", cmd.req_id);
-                    return 0;
-                }
-
-                px_extract_string_any(root, "password", "Password", cmd.pass, sizeof(cmd.pass));
-            }
-
-            cJSON_Delete(root);
+            bool queued = px_ble_queue_completed_json_from_accumulator();
             px_wifi_accum_reset();
 
-            if (!px_enqueue_prov_cmd(&cmd)) {
-                px_status_publish_error("BUSY", "Provisioning worker is busy", cmd.req_id);
-            }
-
-            return 0;
+            return queued ? 0 : BLE_ATT_ERR_UNLIKELY;
         }
+
         return BLE_ATT_ERR_REQ_NOT_SUPPORTED;
     }
 
@@ -2443,6 +3620,8 @@ static void px_build_ble_name_from_serial(const char* serial, char* out, size_t 
 }
 
 static void px_ble_start_provisioning(void){
+    px_ble_json_worker_start_once();
+
     static bool bt_mem_released = false;
     if (!bt_mem_released) {
         esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
@@ -2474,551 +3653,10 @@ static void px_ble_start_provisioning(void){
     nimble_port_freertos_init(px_nimble_host_task);
 }
 
-// ---------- Wi-Fi roaming ----------
-static int px_roam_scan_period_ms(void)
-{
-    return G.wifi_roam_scan_period_ms > 0 ? G.wifi_roam_scan_period_ms : PX_WIFI_ROAM_SCAN_PERIOD_MS;
-}
-
-static int px_roam_weak_rssi(void)
-{
-    return G.wifi_roam_weak_rssi != 0 ? G.wifi_roam_weak_rssi : PX_WIFI_ROAM_WEAK_RSSI;
-}
-
-static int px_roam_margin_db(void)
-{
-    return G.wifi_roam_margin_db > 0 ? G.wifi_roam_margin_db : PX_WIFI_ROAM_MARGIN_DB;
-}
-
-static int px_roam_min_switch_gap_ms(void)
-{
-    return G.wifi_roam_min_switch_gap_ms > 0 ? G.wifi_roam_min_switch_gap_ms : PX_WIFI_ROAM_MIN_SWITCH_GAP_MS;
-}
-
-static bool px_bssid_equal(const uint8_t a[6], const uint8_t b[6])
-{
-    return memcmp(a, b, 6) == 0;
-}
-
-static const char *px_bssid_fmt(const uint8_t bssid[6], char *out, size_t out_len)
-{
-    if (!out || out_len < 18) return "00:00:00:00:00:00";
-    snprintf(out, out_len, "%02x:%02x:%02x:%02x:%02x:%02x",
-             bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
-    return out;
-}
-
-static px_roam_ap_history_t *px_roam_history_find(const uint8_t bssid[6])
-{
-    for (int i = 0; i < PX_WIFI_ROAM_AP_HISTORY_MAX; i++) {
-        if (px_roam_ap_history[i].valid &&
-            px_bssid_equal(px_roam_ap_history[i].bssid, bssid)) {
-            return &px_roam_ap_history[i];
-        }
-    }
-    return NULL;
-}
-
-static px_roam_ap_history_t *px_roam_history_get_or_create(const uint8_t bssid[6])
-{
-    px_roam_ap_history_t *h = px_roam_history_find(bssid);
-    if (h) return h;
-
-    int slot = -1;
-    uint64_t oldest = UINT64_MAX;
-
-    for (int i = 0; i < PX_WIFI_ROAM_AP_HISTORY_MAX; i++) {
-        if (!px_roam_ap_history[i].valid) {
-            slot = i;
-            break;
-        }
-        uint64_t t = px_roam_ap_history[i].last_seen_ms;
-        if (t < oldest) {
-            oldest = t;
-            slot = i;
-        }
-    }
-
-    if (slot < 0) slot = 0;
-
-    memset(&px_roam_ap_history[slot], 0, sizeof(px_roam_ap_history[slot]));
-    px_roam_ap_history[slot].valid = true;
-    memcpy(px_roam_ap_history[slot].bssid, bssid, 6);
-    return &px_roam_ap_history[slot];
-}
-
-static void px_roam_history_note_seen(const wifi_ap_record_t *ap)
-{
-    if (!ap) return;
-    px_roam_ap_history_t *h = px_roam_history_get_or_create(ap->bssid);
-    if (!h) return;
-
-    h->last_rssi = ap->rssi;
-    h->channel = ap->primary;
-    h->last_seen_ms = px_nowMs();
-}
-
-static void px_roam_history_note_connected(const wifi_ap_record_t *ap)
-{
-    if (!ap) return;
-
-    px_roam_ap_history_t *h = px_roam_history_get_or_create(ap->bssid);
-    if (!h) return;
-
-    uint64_t now = px_nowMs();
-
-    h->last_rssi = ap->rssi;
-    h->channel = ap->primary;
-    h->last_seen_ms = now;
-    h->last_connected_ms = now;
-
-    if (h->success_count < 20) h->success_count++;
-
-    /* A successful connection slowly heals old penalties. */
-    if (h->fail_count > 0) h->fail_count--;
-    if (h->beacon_timeout_count > 0) h->beacon_timeout_count--;
-
-    h->blacklist_until_ms = 0;
-
-    memcpy(px_current_bssid, ap->bssid, 6);
-    px_current_bssid_valid = true;
-
-    char b[24];
-    ESP_LOGI(PX_TAG,
-             "Roam history: connected BSSID=%s success=%d fail=%d beacon=%d rssi=%d",
-             px_bssid_fmt(ap->bssid, b, sizeof(b)),
-             h->success_count, h->fail_count, h->beacon_timeout_count, ap->rssi);
-}
-
-static void px_roam_history_note_disconnect(int32_t reason)
-{
-    if (!px_current_bssid_valid) return;
-
-    px_roam_ap_history_t *h = px_roam_history_get_or_create(px_current_bssid);
-    if (!h) {
-        px_current_bssid_valid = false;
-        return;
-    }
-
-    uint64_t now = px_nowMs();
-    bool hard_failure = false;
-
-    h->last_seen_ms = now;
-
-    if (reason == WIFI_REASON_BEACON_TIMEOUT) {
-        h->beacon_timeout_count++;
-        h->fail_count++;
-        hard_failure = true;
-    } else if (reason == WIFI_REASON_NO_AP_FOUND) {
-        h->fail_count++;
-        hard_failure = true;
-    } else {
-        /*
-         * General disconnect. Count it lightly but still learn from repeated failures.
-         * We avoid depending on many reason-code macros here so this remains portable
-         * across ESP-IDF versions.
-         */
-        h->fail_count++;
-    }
-
-    if (h->fail_count > 50) h->fail_count = 50;
-    if (h->beacon_timeout_count > 50) h->beacon_timeout_count = 50;
-
-    if (hard_failure || h->fail_count >= PX_WIFI_ROAM_BAD_FAIL_LIMIT) {
-        h->blacklist_until_ms = now + PX_WIFI_ROAM_BLACKLIST_MS;
-    }
-
-    char b[24];
-    ESP_LOGW(PX_TAG,
-             "Roam history: AP fault BSSID=%s reason=%ld fail=%d beacon=%d blacklist_ms=%lu",
-             px_bssid_fmt(px_current_bssid, b, sizeof(b)),
-             (long)reason,
-             h->fail_count,
-             h->beacon_timeout_count,
-             (unsigned long)(h->blacklist_until_ms > now ? (h->blacklist_until_ms - now) : 0));
-
-    px_current_bssid_valid = false;
-}
-
-static int px_roam_ap_score(const wifi_ap_record_t *ap,
-                            const wifi_ap_record_t *cur_ap,
-                            bool allow_blacklisted,
-                            bool *rejected_blacklist)
-{
-    if (rejected_blacklist) *rejected_blacklist = false;
-    if (!ap) return -9999;
-
-    uint64_t now = px_nowMs();
-    px_roam_history_note_seen(ap);
-    px_roam_ap_history_t *h = px_roam_history_find(ap->bssid);
-
-    if (h && h->blacklist_until_ms > now && !allow_blacklisted) {
-        if (rejected_blacklist) *rejected_blacklist = true;
-        return -9999;
-    }
-
-    int score = ap->rssi;  /* RSSI is negative; less negative is better. */
-
-    if (h) {
-        score -= h->fail_count * PX_WIFI_ROAM_FAIL_PENALTY;
-        score -= h->beacon_timeout_count * PX_WIFI_ROAM_BEACON_PENALTY;
-
-        int bonus = h->success_count * PX_WIFI_ROAM_SUCCESS_BONUS;
-        if (bonus > 20) bonus = 20;
-        score += bonus;
-
-        if (h->blacklist_until_ms > now && allow_blacklisted) {
-            /* Fallback mode only: still strongly penalize a blacklisted AP. */
-            score -= 60;
-        }
-    }
-
-    if (cur_ap && px_bssid_equal(ap->bssid, cur_ap->bssid)) {
-        score += PX_WIFI_ROAM_CURRENT_AP_BONUS;
-    }
-
-    return score;
-}
-
-static bool px_roam_choose_best_from_scan(const wifi_ap_record_t *aps,
-                                          uint16_t count,
-                                          const char *ssid,
-                                          const wifi_ap_record_t *cur_ap,
-                                          bool include_current,
-                                          bool allow_blacklisted,
-                                          wifi_ap_record_t *best_out,
-                                          int *best_score_out,
-                                          int *current_score_out)
-{
-    if (!aps || !ssid || !best_out) return false;
-
-    bool found = false;
-    int best_score = -9999;
-    int current_score = -9999;
-    uint64_t now = px_nowMs();
-
-    for (uint16_t i = 0; i < count; i++) {
-        if (aps[i].ssid[0] == '\0') continue;
-        if (strcmp((const char *)aps[i].ssid, ssid) != 0) continue;
-
-        bool is_current = cur_ap && px_bssid_equal(aps[i].bssid, cur_ap->bssid);
-        if (is_current && !include_current) {
-            bool rejected = false;
-            current_score = px_roam_ap_score(&aps[i], cur_ap, true, &rejected);
-            continue;
-        }
-
-        bool rejected_blacklist = false;
-        int score = px_roam_ap_score(&aps[i], cur_ap, allow_blacklisted, &rejected_blacklist);
-
-        char b[24];
-        px_roam_ap_history_t *h = px_roam_history_find(aps[i].bssid);
-        ESP_LOGI(PX_TAG,
-                 "Roam scored AP: RSSI=%d SCORE=%d CH=%d BSSID=%s fail=%d beacon=%d success=%d blacklisted=%d",
-                 aps[i].rssi,
-                 score,
-                 aps[i].primary,
-                 px_bssid_fmt(aps[i].bssid, b, sizeof(b)),
-                 h ? h->fail_count : 0,
-                 h ? h->beacon_timeout_count : 0,
-                 h ? h->success_count : 0,
-                 (h && h->blacklist_until_ms > now) ? 1 : 0);
-
-        if (rejected_blacklist) continue;
-
-        if (!found || score > best_score) {
-            *best_out = aps[i];
-            best_score = score;
-            found = true;
-        }
-
-        if (is_current) current_score = score;
-    }
-
-    if (best_score_out) *best_score_out = best_score;
-    if (current_score_out) *current_score_out = current_score;
-    return found;
-}
-
-static bool px_wifi_select_best_ap_config(bool force_scan)
-{
-    char ssid[64] = {0};
-    char pass[64] = {0};
-    px_nvs_get_strz(PX_KEY_SSID, ssid, sizeof(ssid));
-    px_nvs_get_strz(PX_KEY_PASS, pass, sizeof(pass));
-    if (ssid[0] == '\0') return false;
-
-    uint64_t now = px_nowMs();
-    if (!force_scan && px_last_wifi_recovery_scan_ms != 0 &&
-        (now - px_last_wifi_recovery_scan_ms) < PX_WIFI_RECOVERY_SCAN_GAP_MS) {
-        return false;
-    }
-    px_last_wifi_recovery_scan_ms = now;
-
-    wifi_scan_config_t scan_cfg = {0};
-    scan_cfg.ssid = (uint8_t *)ssid;
-    scan_cfg.bssid = NULL;
-    scan_cfg.channel = 0;
-    scan_cfg.show_hidden = false;
-
-    ESP_LOGI(PX_TAG, "Wi-Fi recovery scan with AP scoring: SSID=%s", ssid);
-
-    esp_err_t err = esp_wifi_scan_start(&scan_cfg, true);
-    if (err != ESP_OK) {
-        ESP_LOGW(PX_TAG, "Wi-Fi recovery scan failed: %s", esp_err_to_name(err));
-        return false;
-    }
-
-    uint16_t count = PX_WIFI_ROAM_SCAN_MAX_RESULTS;
-    wifi_ap_record_t aps[PX_WIFI_ROAM_SCAN_MAX_RESULTS];
-    memset(aps, 0, sizeof(aps));
-
-    err = esp_wifi_scan_get_ap_records(&count, aps);
-    if (err != ESP_OK) {
-        ESP_LOGW(PX_TAG, "Wi-Fi recovery scan read failed: %s", esp_err_to_name(err));
-        return false;
-    }
-
-    wifi_ap_record_t best_ap;
-    memset(&best_ap, 0, sizeof(best_ap));
-    int best_score = -9999;
-
-    bool found = px_roam_choose_best_from_scan(aps, count, ssid, NULL, true, false,
-                                               &best_ap, &best_score, NULL);
-
-    if (!found) {
-        uint64_t since_disconnect = px_last_wifi_disconnect_ms ? (now - px_last_wifi_disconnect_ms) : 0;
-        if (since_disconnect >= PX_WIFI_ROAM_BLACKLIST_FALLBACK_MS) {
-            ESP_LOGW(PX_TAG, "Wi-Fi recovery: all APs are blacklisted or rejected; using fallback scoring");
-            found = px_roam_choose_best_from_scan(aps, count, ssid, NULL, true, true,
-                                                  &best_ap, &best_score, NULL);
-        }
-    }
-
-    wifi_config_t w = {0};
-    strlcpy((char *)w.sta.ssid, ssid, sizeof(w.sta.ssid));
-    strlcpy((char *)w.sta.password, pass, sizeof(w.sta.password));
-    w.sta.threshold.authmode = WIFI_AUTH_OPEN;
-    w.sta.pmf_cfg.capable = true;
-    w.sta.pmf_cfg.required = false;
-
-    if (found) {
-        w.sta.bssid_set = true;
-        memcpy(w.sta.bssid, best_ap.bssid, 6);
-        w.sta.channel = best_ap.primary;
-        char b[24];
-        ESP_LOGI(PX_TAG,
-                 "Wi-Fi recovery selected AP by score: score=%d RSSI=%d CH=%d BSSID=%s",
-                 best_score, best_ap.rssi, best_ap.primary,
-                 px_bssid_fmt(best_ap.bssid, b, sizeof(b)));
-    } else {
-        /* No scan result found. Clear BSSID lock so the Wi-Fi driver can choose any AP. */
-        w.sta.bssid_set = false;
-        w.sta.channel = 0;
-        ESP_LOGW(PX_TAG, "Wi-Fi recovery found no usable AP; clearing BSSID lock and using normal SSID reconnect");
-    }
-
-    err = esp_wifi_set_config(WIFI_IF_STA, &w);
-    if (err != ESP_OK) {
-        ESP_LOGW(PX_TAG, "Wi-Fi recovery set_config failed: %s", esp_err_to_name(err));
-        return false;
-    }
-
-    return true;
-}
-
-static void px_wifi_roaming_check_if_due(void)
-{
-    if (!G.wifi_roaming_enable) return;
-    if (px_is_ble_mode_flag) return;
-    if (px_ota_pending_verify) return;
-    if (px_ota_task_running || px_ota_update_in_progress_flag || px_ota_manual_request) return;
-    if (px_wifi_roam_in_progress) return;
-    if (!px_wifi_is_connected()) return;
-
-    /* Keep roaming conservative. */
-    if (!px_mqtt_is_connected()) return;
-
-    uint64_t now = px_nowMs();
-    int scan_period = px_roam_scan_period_ms();
-    if (scan_period < 30000) scan_period = 30000;
-
-    if (px_last_roam_scan_ms != 0 &&
-        (now - px_last_roam_scan_ms) < (uint64_t)scan_period) {
-        return;
-    }
-    px_last_roam_scan_ms = now;
-
-    wifi_ap_record_t cur_ap;
-    if (esp_wifi_sta_get_ap_info(&cur_ap) != ESP_OK) return;
-
-    px_roam_history_note_connected(&cur_ap);
-
-    int weak_rssi = px_roam_weak_rssi();
-    int margin_db = px_roam_margin_db();
-    int min_gap_ms = px_roam_min_switch_gap_ms();
-
-    /* RSSI is negative. Example: -62 is better than -82. */
-    if (cur_ap.rssi > weak_rssi) {
-        return;
-    }
-
-    if (px_last_roam_switch_ms != 0 &&
-        (now - px_last_roam_switch_ms) < (uint64_t)min_gap_ms) {
-        return;
-    }
-
-    char ssid[64] = {0};
-    char pass[64] = {0};
-    px_nvs_get_strz(PX_KEY_SSID, ssid, sizeof(ssid));
-    px_nvs_get_strz(PX_KEY_PASS, pass, sizeof(pass));
-    if (ssid[0] == '\0') return;
-
-    px_wifi_roam_in_progress = true;
-
-    ESP_LOGI(PX_TAG,
-             "Wi-Fi roaming score scan: current SSID=%s RSSI=%d threshold=%d margin=%d",
-             ssid, cur_ap.rssi, weak_rssi, margin_db);
-
-    wifi_scan_config_t scan_cfg = {0};
-    scan_cfg.ssid = (uint8_t *)ssid;
-    scan_cfg.bssid = NULL;
-    scan_cfg.channel = 0;
-    scan_cfg.show_hidden = false;
-
-    esp_err_t err = esp_wifi_scan_start(&scan_cfg, true);
-    if (err != ESP_OK) {
-        ESP_LOGW(PX_TAG, "Wi-Fi roaming scan failed: %s", esp_err_to_name(err));
-        px_wifi_roam_in_progress = false;
-        return;
-    }
-
-    uint16_t count = PX_WIFI_ROAM_SCAN_MAX_RESULTS;
-    wifi_ap_record_t aps[PX_WIFI_ROAM_SCAN_MAX_RESULTS];
-    memset(aps, 0, sizeof(aps));
-
-    err = esp_wifi_scan_get_ap_records(&count, aps);
-    if (err != ESP_OK) {
-        ESP_LOGW(PX_TAG, "Wi-Fi roaming scan read failed: %s", esp_err_to_name(err));
-        px_wifi_roam_in_progress = false;
-        return;
-    }
-
-    wifi_ap_record_t best_ap;
-    memset(&best_ap, 0, sizeof(best_ap));
-    int best_score = -9999;
-    int current_score = -9999;
-
-    bool found = px_roam_choose_best_from_scan(aps, count, ssid, &cur_ap, false, false,
-                                               &best_ap, &best_score, &current_score);
-
-    if (!found) {
-        ESP_LOGI(PX_TAG, "Wi-Fi roaming: no non-blacklisted alternative AP found");
-        px_wifi_roam_in_progress = false;
-        return;
-    }
-
-    if (current_score <= -9000) {
-        current_score = px_roam_ap_score(&cur_ap, &cur_ap, true, NULL);
-    }
-
-    int rssi_gain = best_ap.rssi - cur_ap.rssi;
-
-/*
- * Normal score-based roaming:
- * This respects AP reliability history, blacklist, success count, and fail count.
- */
-bool score_says_roam = best_score >= (current_score + margin_db);
-
-/*
- * Strong RSSI override:
- * If another AP is much stronger, do not let the current AP success bonus
- * block roaming forever.
- *
- * Example:
- * Current AP = -76 dBm
- * Best AP    = -57 dBm
- * RSSI gain  = 19 dB
- * Result     = allow roaming
- */
-bool strong_rssi_override = false;
-
-if (best_ap.rssi > cur_ap.rssi) {
-    if (rssi_gain >= 15 && best_ap.rssi >= -70) {
-        strong_rssi_override = true;
-    }
-}
-
-if (!score_says_roam && !strong_rssi_override) {
-    char b[24];
-    ESP_LOGI(PX_TAG,
-             "Wi-Fi roaming: staying on current AP. current_score=%d best_score=%d margin=%d rssi_gain=%d best=%s rssi=%d",
-             current_score,
-             best_score,
-             margin_db,
-             rssi_gain,
-             px_bssid_fmt(best_ap.bssid, b, sizeof(b)),
-             best_ap.rssi);
-
-    px_wifi_roam_in_progress = false;
-    return;
-}
-
-    char best_b[24], cur_b[24];
-    ESP_LOGW(PX_TAG,
-             "Wi-Fi roaming: switching AP by reliability score. current=%s RSSI=%d score=%d -> best=%s RSSI=%d score=%d CH=%d",
-             px_bssid_fmt(cur_ap.bssid, cur_b, sizeof(cur_b)), cur_ap.rssi, current_score,
-             px_bssid_fmt(best_ap.bssid, best_b, sizeof(best_b)), best_ap.rssi, best_score, best_ap.primary);
-
-    wifi_config_t w = {0};
-    strlcpy((char *)w.sta.ssid, ssid, sizeof(w.sta.ssid));
-    strlcpy((char *)w.sta.password, pass, sizeof(w.sta.password));
-    w.sta.threshold.authmode = WIFI_AUTH_OPEN;
-    w.sta.pmf_cfg.capable = true;
-    w.sta.pmf_cfg.required = false;
-    w.sta.bssid_set = true;
-    memcpy(w.sta.bssid, best_ap.bssid, 6);
-    w.sta.channel = best_ap.primary;
-
-    /* MQTT will reconnect cleanly after Wi-Fi comes back. */
-    if (px_mqtt) {
-        px_mqtt_stop_if_any();
-        px_ws_state = PX_ST_DISCONNECTED;
-        px_tls_state = PX_ST_DISCONNECTED;
-    }
-
-    px_ota_online_stable_since_ms = 0;
-    xEventGroupClearBits(px_wifi_events(), PXWIFI_CONNECTED_BIT);
-
-    esp_wifi_disconnect();
-    vTaskDelay(pdMS_TO_TICKS(250));
-
-    err = esp_wifi_set_config(WIFI_IF_STA, &w);
-    if (err != ESP_OK) {
-        ESP_LOGW(PX_TAG, "Wi-Fi roaming set_config failed: %s", esp_err_to_name(err));
-        px_wifi_roam_in_progress = false;
-        return;
-    }
-
-    err = esp_wifi_connect();
-    if (err == ESP_OK || err == ESP_ERR_WIFI_CONN) {
-        px_last_roam_switch_ms = px_nowMs();
-        px_wifi_recovery_in_progress = true;
-        ESP_LOGI(PX_TAG, "Wi-Fi roaming reconnect started");
-        /* Keep px_wifi_roam_in_progress true until GOT_IP, so Wi-Fi/MQTT faults are classified correctly. */
-        return;
-    } else {
-        ESP_LOGW(PX_TAG, "Wi-Fi roaming reconnect failed: %s", esp_err_to_name(err));
-    }
-
-    px_wifi_roam_in_progress = false;
-    px_wifi_recovery_in_progress = false;
-}
-
 // ---------- Service loops ----------
 static void px_wifi_strength_publish_if_due(void){
     if (G.wifi_strength_period_ms <= 0) return;
-    if (!px_mqtt) return;
+    if (!px_mqtt_is_connected()) return;
     if (px_ota_update_in_progress_flag) return;
 
     uint64_t ms = px_nowMs();
@@ -3031,15 +3669,19 @@ static void px_wifi_strength_publish_if_due(void){
     cJSON* root1 = cJSON_CreateObject();
     cJSON_AddStringToObject(root1, "Signal_Strength", px_signal_label_from_rssi(r));
     char* out1 = cJSON_PrintUnformatted(root1);
-    esp_mqtt_client_publish(px_mqtt, px_topic_tx, out1, 0, 1, true);
-    cJSON_free(out1);
+    if (out1) {
+        esp_mqtt_client_publish(px_mqtt, px_topic_tx, out1, 0, 1, true);
+        cJSON_free(out1);
+    }
     cJSON_Delete(root1);
 
     cJSON* root2 = cJSON_CreateObject();
     cJSON_AddNumberToObject(root2, "WiFi_Strength_RSSI", r);
     char* out2 = cJSON_PrintUnformatted(root2);
-    esp_mqtt_client_publish(px_mqtt, px_topic_tx, out2, 0, 1, true);
-    cJSON_free(out2);
+    if (out2) {
+        esp_mqtt_client_publish(px_mqtt, px_topic_tx, out2, 0, 1, true);
+        cJSON_free(out2);
+    }
     cJSON_Delete(root2);
 }
 
@@ -3057,6 +3699,12 @@ static void px_service_task(void* arg)
     (void)arg;
 
     while (1) {
+        if (px_factory_identity_mode) {
+            px_factory_identity_reconnect_if_needed();
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
         if (!px_is_ble_mode_flag) {
 
             /*
@@ -3067,15 +3715,20 @@ static void px_service_task(void* arg)
             if (!px_wifi_is_connected()) {
                 px_wifi_reconnect_if_needed();
 
-                if (px_mqtt) {
-                    px_mqtt_stop_if_any();
-                    px_ws_state = PX_ST_DISCONNECTED;
-                    px_tls_state = PX_ST_DISCONNECTED;
-                }
+                /*
+                 * Wi-Fi is not IP-ready. Stop MQTT reconnect attempts completely
+                 * until GOT_IP. Otherwise esp-mqtt may try DNS/TLS during AP
+                 * association and produce misleading MQTT errors such as
+                 * "Host is unreachable" or "No PING_RESP".
+                 */
+                px_mqtt_suspend_until_wifi_ready();
 
                 vTaskDelay(pdMS_TO_TICKS(500));
                 continue;
             }
+
+            px_mqtt_suspended_for_wifi = false;
+            px_mqtt_fault_deferred_check();
 
             if (px_ota_update_in_progress_flag) {
                 /*
@@ -3086,38 +3739,47 @@ static void px_service_task(void* arg)
             }
 
             /*
-             * First keep MQTT connected/reconnected.
+             * Fast normal boot:
+             * The gate application does not need to wait for MQTT to be online.
+             * Start Part B as soon as Wi-Fi is up. MQTT commands will arrive later
+             * through the already-registered callback after MQTT connects.
+             * For OTA pending-verify boot, keep the old safety rule and delay app
+             * start until rollback validation passes.
+             */
+#if PX_FAST_APP_START_AFTER_WIFI
+            if (!px_ota_pending_verify && px_wifi_is_connected()) {
+                px_app_start_if_allowed();
+            }
+#endif
+
+            /*
+             * Keep MQTT connected/reconnected.
              * OTA checking happens only after MQTT is connected and stable.
              */
-            if (px_mqtt) {
-                bool connected =
-                    (px_current_transport == PX_TRANS_WSS && px_ws_state == PX_ST_CONNECTED) ||
-                    (px_current_transport == PX_TRANS_TLS && px_tls_state == PX_ST_CONNECTED);
-
-                bool connecting =
-                    (px_current_transport == PX_TRANS_WSS && px_ws_state == PX_ST_CONNECTING) ||
-                    (px_current_transport == PX_TRANS_TLS && px_tls_state == PX_ST_CONNECTING);
-
-                if (connecting) {
-                    if ((px_nowUs() - px_attempt_start_us) > (uint64_t)PX_ATTEMPT_TIMEOUT_MS * 1000ULL) {
-                        if (px_ok_to_flip()) {
-                            px_flip_transport();
-                        }
-                    }
-                } else if (!connected) {
-                    if (px_ok_to_flip()) {
-                        if (px_current_transport == PX_TRANS_WSS) {
-                            px_mqtt_try_once_wss();
-                        } else {
-                            px_mqtt_try_once_tls();
-                        }
-                    }
-                }
+            if (!px_mqtt) {
+                px_current_transport = PX_TRANS_WSS;
+                px_mqtt_try_once_wss();
             } else {
-                if (px_current_transport == PX_TRANS_WSS) {
-                    px_mqtt_try_once_wss();
-                } else {
-                    px_mqtt_try_once_tls();
+                bool connected = (px_ws_state == PX_ST_CONNECTED);
+                bool connecting = (px_ws_state == PX_ST_CONNECTING);
+
+                /*
+                 * WSS-only reliability:
+                 * esp-mqtt now owns reconnects. Do not destroy/recreate the client
+                 * on every WebSocket EOF, because that causes repeated TLS/WSS
+                 * handshakes and makes ESP32 look unstable. Only force-recreate if
+                 * the client is stuck for a very long time.
+                 */
+                if (!connected && !connecting) {
+                    px_ws_state = PX_ST_CONNECTING;
+                    px_attempt_start_us = px_nowUs();
+                }
+
+                if (connecting &&
+                    (px_nowUs() - px_attempt_start_us) > (uint64_t)PX_ATTEMPT_TIMEOUT_MS * 1000ULL &&
+                    px_ok_to_flip()) {
+                    ESP_LOGW(PX_TAG, "MQTT WSS appears stuck, recreating client once");
+                    px_restart_wss_transport();
                 }
             }
 
@@ -3141,7 +3803,7 @@ static void px_service_task(void* arg)
             px_ota_auto_check_if_due();
 
             px_wifi_strength_publish_if_due();
-            px_wifi_roaming_check_if_due();
+
 
         } else {
             px_wifi_buffer_housekeeping();
@@ -3195,10 +3857,12 @@ void px_set_message_callback(px_msg_cb_t cb){
 }
 
 bool px_is_config_mode(void){
-    return px_is_ble_mode_flag;
+    return px_is_ble_mode_flag || px_factory_identity_mode;
 }
 
 bool px_boot_is_config_mode(void){
+    if (px_factory_identity_mode) return true;
+
     bool configMode = px_nvs_get_bool(PX_KEY_CFG_MODE, false);
     bool cfgLock = px_nvs_get_bool(PX_KEY_CFG_LOCK, false);
 
@@ -3223,11 +3887,22 @@ void px_init(const px_cfg_t* cfg){
     memset(&G, 0, sizeof(G));
     G = *cfg;
 
+
     px_ota_pending_verify = px_ota_running_app_is_pending_verify();
     px_nvs_init_open();
 
-    if (!G.device_serial || !G.auth_number || !G.mqtt_host || !G.mqtt_wss_uri) {
+    if (!G.mqtt_host || !G.mqtt_wss_uri) {
+        ESP_LOGE(PX_TAG, "MQTT endpoint missing in px_cfg_t");
         abort();
+    }
+
+    px_identity_ready = px_identity_load_or_bind_from_nvs();
+    px_factory_identity_mode = !px_identity_ready;
+
+    if (px_factory_identity_mode) {
+        /* Identity setup mode must not use MQTT topics, MQTT auth, BLE Wi-Fi provisioning, or Part B. */
+        px_app_start_allowed = false;
+        strlcpy(px_hostname, "Pearlexa-Factory", sizeof(px_hostname));
     }
 
     if (G.ota_check_on_boot || G.ota_periodic_check_ms > 0) {
@@ -3239,11 +3914,20 @@ void px_init(const px_cfg_t* cfg){
         }
     }
 
-    snprintf(px_topic_tx, sizeof(px_topic_tx), "%s/TX", G.device_serial);
-    snprintf(px_topic_rx, sizeof(px_topic_rx), "%s/RX", G.device_serial);
-    snprintf(px_topic_status, sizeof(px_topic_status), "%s/status", G.device_serial);
+    if (px_identity_ready) {
+        snprintf(px_topic_tx, sizeof(px_topic_tx), "%s/TX", G.device_serial);
+        snprintf(px_topic_rx, sizeof(px_topic_rx), "%s/RX", G.device_serial);
+        snprintf(px_topic_status, sizeof(px_topic_status), "%s/status", G.device_serial);
 
-    px_build_hostname_from_serial(G.device_serial, px_hostname, sizeof(px_hostname));
+        px_build_hostname_from_serial(G.device_serial, px_hostname, sizeof(px_hostname));
+        px_build_mqtt_client_id();
+    } else {
+        px_topic_tx[0] = 0;
+        px_topic_rx[0] = 0;
+        px_topic_status[0] = 0;
+        px_mqtt_client_id[0] = 0;
+        strlcpy(px_hostname, "Pearlexa-Factory", sizeof(px_hostname));
+    }
 
     int restartCount = px_nvs_get_int(PX_KEY_RST_COUNT, 0) + 1;
     px_nvs_set_int(PX_KEY_RST_COUNT, restartCount);
@@ -3266,6 +3950,7 @@ void px_init(const px_cfg_t* cfg){
         px_nvs_set_int(PX_KEY_RST_COUNT, 0);
     }
 
+    /* WSS-only for both ESP32 and ESP32-C3. */
     px_current_transport = PX_TRANS_WSS;
     px_ws_state = PX_ST_DISCONNECTED;
     px_tls_state = PX_ST_DISCONNECTED;
@@ -3281,11 +3966,17 @@ void px_init(const px_cfg_t* cfg){
     px_ota_manual_request = false;
     px_ota_last_check_ms = 0;
     px_ota_online_stable_since_ms = 0;
-    px_last_roam_scan_ms = 0;
-    px_last_roam_switch_ms = 0;
-    px_wifi_roam_in_progress = false;
+                    px_wifi_associated_ms = 0;
+    px_wifi_last_wait_ip_log_ms = 0;
+    px_mqtt_transport_fault_count = 0;
+    px_mqtt_transport_fault_window_ms = 0;
+    px_mqtt_last_connected_ms = 0;
+    px_mqtt_last_fault_ms = 0;
+        px_mqtt_suspended_for_wifi = false;
+    px_mqtt_fault_pending_until_ms = 0;
+    px_mqtt_fault_pending_started_ms = 0;
     px_app_started_flag = false;
-    px_app_start_allowed = !px_ota_pending_verify;
+    px_app_start_allowed = (!px_ota_pending_verify && !px_factory_identity_mode);
 
     if (!px_ota_pending_verify) {
         px_ota_phase_t old_phase = px_ota_get_phase();
@@ -3317,6 +4008,22 @@ void px_init(const px_cfg_t* cfg){
 }
 
 void px_start(void){
+    if (px_factory_identity_mode) {
+        px_is_ble_mode_flag = false;
+        px_factory_identity_start();
+
+        xTaskCreatePinnedToCore(
+            px_service_task,
+            "px_service_task",
+            6144,
+            NULL,
+            5,
+            NULL,
+            tskNO_AFFINITY
+        );
+        return;
+    }
+
     px_is_ble_mode_flag = px_boot_is_config_mode();
 
     xTaskCreatePinnedToCore(
@@ -3349,6 +4056,9 @@ void px_start(void){
         tskNO_AFFINITY
     );
 }
+
+
+
 
 
 

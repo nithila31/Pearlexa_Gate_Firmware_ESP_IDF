@@ -4,6 +4,7 @@
 //  ✅ App does NOT start itself immediately after px_start()
 //  ✅ Part A starts Part B only after normal boot or after OTA validation
 //  ✅ Safe-stop callback confirms all gate outputs are LOW before OTA flashing
+//  ✅ OTA-safe Flash Encryption DEVELOPMENT -> RELEASE production lock
 //
 // PIN MAP:
 //   OPEN  -> GPIO16
@@ -23,21 +24,44 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_flash_encrypt.h"
 #include "driver/gpio.h"
 #include "cJSON.h"
-
 #include "pearlexa_connect.h"
 
-// ======= App config you fill in (serial, tokens, endpoints) =======
-static const char* APP_DEVICE_SERIAL = "SN:G1005005";
-static const char* APP_AUTH_NUMBER   = "vow9kltt9vXXQfgvZ49fK8d3TaLTUg7XIUb1SE0VT4QKFxjippcai2DFx78EHzRh";
+// ---------------------------------------------------------------------------------
+// Part A API declarations.
+// If Part B is below Part A in the same main.c file, these are already known.
+// These declarations are kept here to make Part B clear and reusable.
+// ---------------------------------------------------------------------------------
+void px_init(const px_cfg_t* cfg);
+void px_start(void);
+void px_publish_json(const char* json);
+void px_set_message_callback(px_msg_cb_t cb);
+bool px_mqtt_is_connected(void);
+bool px_is_config_mode(void);
+bool px_ota_update_is_in_progress(void);
+bool px_ota_first_boot_validation_pending(void);
+bool px_app_is_started(void);
+
+void px_set_app_start_callback(void (*cb)(void));
+void px_set_app_stop_callback(void (*cb)(void));
+void px_set_ota_prepare_callback(bool (*cb)(void));
+void px_set_app_self_test_callback(bool (*cb)(void));
+
+// ======= App config you fill in (common firmware endpoints only) =======
+// Device identity is no longer hardcoded here.
+// Part A loads these from NVS namespace "px":
+//   deviceSerial = "SN:G1005005"
+//   authNumber   = "device-specific-token"
 static const char* APP_MQTT_HOST     = "mqttserver1.pearlexa.cloud";
 static const int   APP_TLS_PORT      = 8883;
 static const char* APP_WSS_URI       = "wss://mqttserver1.pearlexa.cloud/mqtt";
 static const int   APP_WIFI_STRENGTH_PERIOD_MS = 60000;
 
 // OTA
-static const char* APP_FW_VERSION = "1.0.0";
+// Increase this version for the production-lock OTA.
+static const char* APP_FW_VERSION = "1.0.2";
 static const char* APP_OTA_VERSION_URL = "https://raw.githubusercontent.com/nithila31/pearlexa-ota-test/refs/heads/main/version.json";
 
 // Optional metadata protection used by the new universal Part A.
@@ -51,14 +75,66 @@ static const char* APP_DEVICE_TYPE = "gate_controller";
 
 static const char* TAG_APP = "APP";
 
+// ---------------------------------------------------------------------------------
+// OTA-safe one-time production lock for ESP32 Flash Encryption
+//
+// IMPORTANT:
+//   1. This function is NOT called from app_main().
+//   2. It is called from app_start() only after Part A allows the product app.
+//   3. For OTA rollback mode, Part A allows app_start() only after validation.
+//   4. This moves Flash Encryption from DEVELOPMENT mode to RELEASE mode.
+//   5. After this runs, future normal firmware updates should be done by OTA.
+//   6. After successful production lock, publish another normal OTA firmware with
+//      APP_ENABLE_FLASH_ENCRYPTION_RELEASE_LOCK set to 0.
+// ---------------------------------------------------------------------------------
+#define APP_ENABLE_FLASH_ENCRYPTION_RELEASE_LOCK  0
+
+static void app_flash_encryption_release_lock_once(void)
+{
+#if APP_ENABLE_FLASH_ENCRYPTION_RELEASE_LOCK
+    esp_flash_enc_mode_t mode = esp_get_flash_encryption_mode();
+
+    if (mode == ESP_FLASH_ENC_MODE_DEVELOPMENT) {
+        ESP_LOGW(TAG_APP, "======================================================");
+        ESP_LOGW(TAG_APP, "FLASH ENCRYPTION: DEVELOPMENT -> RELEASE MODE");
+        ESP_LOGW(TAG_APP, "OTA image has already passed Part A validation.");
+        ESP_LOGW(TAG_APP, "This is a one-way production security lock.");
+        ESP_LOGW(TAG_APP, "Future normal firmware updates must be done by OTA.");
+        ESP_LOGW(TAG_APP, "======================================================");
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        esp_flash_encryption_set_release_mode();
+
+        ESP_LOGW(TAG_APP, "Release mode eFuses burned. Restarting now...");
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_restart();
+    }
+
+    if (mode == ESP_FLASH_ENC_MODE_RELEASE) {
+        ESP_LOGI(TAG_APP, "Flash encryption already in RELEASE/production mode.");
+        return;
+    }
+
+    ESP_LOGE(TAG_APP, "Flash encryption is not enabled. Production lock skipped.");
+#else
+    ESP_LOGI(TAG_APP, "Flash encryption release lock is disabled in this firmware.");
+#endif
+}
+
+#ifdef CONFIG_IDF_TARGET_ESP32C3
+#define OPEN_CMD_PIN            4
+#define CLOSE_CMD_PIN           5
+#define STOP_CMD_PIN            6
+#define GATE_STATE_PIN          7
+#else
 #define OPEN_CMD_PIN            16
 #define CLOSE_CMD_PIN           17
 #define STOP_CMD_PIN            18
 #define GATE_STATE_PIN          19
+#endif
 
-#define GATE_DEBOUNCE_MS        1000
-#define GATE_CMD_PULSE_MS        500
-#define GATE_CMD_GAP_MS          50
+#define GATE_DEBOUNCE_MS        100
 
 // ---------------- RX defer queue ----------------
 typedef struct {
@@ -81,11 +157,28 @@ static uint64_t app_now_ms(void)
     return esp_timer_get_time() / 1000ULL;
 }
 
-static int json_as_int(cJSON* n)
+static int app_json_get_int_field(const char *json, const char *key)
 {
-    if (!n) return -1;
-    if (cJSON_IsNumber(n)) return (int)n->valuedouble;
-    if (cJSON_IsString(n) && n->valuestring) return atoi(n->valuestring);
+    if (!json || !key || !key[0]) return -1;
+
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+
+    const char *p = strstr(json, pattern);
+    if (!p) return -1;
+
+    p += strlen(pattern);
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != ':') return -1;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+
+    if (*p == '\"') p++;
+    if (*p == '0') return 0;
+    if (*p == '1') return 1;
+    if (strncmp(p, "true", 4) == 0) return 1;
+    if (strncmp(p, "false", 5) == 0) return 0;
+
     return -1;
 }
 
@@ -110,23 +203,6 @@ static bool app_outputs_are_off(void)
     return gpio_get_level(OPEN_CMD_PIN) == 0 &&
            gpio_get_level(CLOSE_CMD_PIN) == 0 &&
            gpio_get_level(STOP_CMD_PIN) == 0;
-}
-
-static void app_pulse_gate_output(gpio_num_t pin, const char* name)
-{
-    if (!s_gpio_ready || !s_app_running || !s_accept_commands) return;
-
-    // Fail-safe behavior: only one command output can ever be active.
-    app_all_outputs_off();
-    vTaskDelay(pdMS_TO_TICKS(GATE_CMD_GAP_MS));
-
-    gpio_set_level(pin, 1);
-    ESP_LOGI(TAG_APP, "%s pulse HIGH", name);
-
-    vTaskDelay(pdMS_TO_TICKS(GATE_CMD_PULSE_MS));
-
-    gpio_set_level(pin, 0);
-    ESP_LOGI(TAG_APP, "%s pulse LOW", name);
 }
 
 // ---------------- GPIO init ----------------
@@ -268,40 +344,26 @@ static void app_rx_worker_task(void* arg)
 
             ESP_LOGI(TAG_APP, "RX(worker): %s", m.payload);
 
-            cJSON* root = cJSON_Parse(m.payload);
-            if (!root) {
-                ESP_LOGW(TAG_APP, "Bad JSON (worker)");
-                continue;
+            // ESP32-C3-safe command parsing: no cJSON_Parse() here.
+            int v;
+
+            v = app_json_get_int_field(m.payload, "Open_Command");
+            if (v >= 0) {
+                gpio_set_level(OPEN_CMD_PIN, v ? 1 : 0);
+                ESP_LOGI(TAG_APP, "Open_Command -> %s", v ? "HIGH" : "LOW");
             }
 
-            int open_cmd  = json_as_int(cJSON_GetObjectItem(root, "Open_Command"));
-            int close_cmd = json_as_int(cJSON_GetObjectItem(root, "Close_Command"));
-            int stop_cmd  = json_as_int(cJSON_GetObjectItem(root, "Stop_Command"));
-
-            bool open_req  = (open_cmd == 1);
-            bool close_req = (close_cmd == 1);
-            bool stop_req  = (stop_cmd == 1);
-
-            int request_count = (open_req ? 1 : 0) +
-                                (close_req ? 1 : 0) +
-                                (stop_req ? 1 : 0);
-
-            if (request_count > 1) {
-                ESP_LOGW(TAG_APP, "Rejected unsafe simultaneous gate commands");
-                app_all_outputs_off();
-            } else if (stop_req) {
-                app_pulse_gate_output(STOP_CMD_PIN, "Stop_Command");
-            } else if (open_req) {
-                app_pulse_gate_output(OPEN_CMD_PIN, "Open_Command");
-            } else if (close_req) {
-                app_pulse_gate_output(CLOSE_CMD_PIN, "Close_Command");
-            } else if (open_cmd == 0 || close_cmd == 0 || stop_cmd == 0) {
-                // Safe idle command. Pulsed outputs should already be LOW,
-                // but force LOW in case the command comes after a reset or fault.
-                app_all_outputs_off();
+            v = app_json_get_int_field(m.payload, "Close_Command");
+            if (v >= 0) {
+                gpio_set_level(CLOSE_CMD_PIN, v ? 1 : 0);
+                ESP_LOGI(TAG_APP, "Close_Command -> %s", v ? "HIGH" : "LOW");
             }
 
-            cJSON_Delete(root);
+            v = app_json_get_int_field(m.payload, "Stop_Command");
+            if (v >= 0) {
+                gpio_set_level(STOP_CMD_PIN, v ? 1 : 0);
+                ESP_LOGI(TAG_APP, "Stop_Command -> %s", v ? "HIGH" : "LOW");
+            }
         }
     }
 }
@@ -370,6 +432,14 @@ static void app_start(void)
     if (s_app_running) return;
     if (app_ota_or_validation_active()) return;
 
+    /*
+     * OTA-safe production lock point:
+     * Part A calls app_start() only when the product app is allowed to run.
+     * During OTA rollback validation, app_ota_or_validation_active() remains true,
+     * so this lock will not run before Part A marks the OTA image valid.
+     */
+    app_flash_encryption_release_lock_once();
+
     ESP_LOGI(TAG_APP, "Starting gate app after Part A approval");
 
     app_gate_gpio_init();
@@ -424,22 +494,21 @@ static void app_on_mqtt_rx(const char* topic, const char* json)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG_APP, "=== Pearlexa Gate app using pearlexa_connect component ===");
+    ESP_LOGI(TAG_APP, "=== Pearlexa Connect (Universal Part A + Gate Part B) ===");
+
+    /*
+     * Do NOT call app_flash_encryption_release_lock_once() here for OTA delivery.
+     * It must run from app_start(), after Part A has completed OTA validation.
+     */
 
     const px_cfg_t cfg = {
-        .device_serial           = APP_DEVICE_SERIAL,
-        .auth_number             = APP_AUTH_NUMBER,
+        // NULL means Part A will read deviceSerial/authNumber from NVS.
+        .device_serial           = NULL,
+        .auth_number             = NULL,
         .mqtt_host               = APP_MQTT_HOST,
         .mqtt_tls_port           = APP_TLS_PORT,
         .mqtt_wss_uri            = APP_WSS_URI,
         .wifi_strength_period_ms = APP_WIFI_STRENGTH_PERIOD_MS,
-
-        // Wi-Fi roaming
-        .wifi_roaming_enable         = true,
-        .wifi_roam_scan_period_ms    = 60000,
-        .wifi_roam_weak_rssi         = -75,
-        .wifi_roam_margin_db         = 12,
-        .wifi_roam_min_switch_gap_ms = 300000,
 
         // OTA
         .firmware_version        = APP_FW_VERSION,
@@ -473,7 +542,7 @@ void app_main(void)
     /*
      * Do not start gate tasks here.
      * Part A will call app_start() when it is safe:
-     *   - normal boot: after Wi-Fi + MQTT are connected
+     *   - normal boot: after Wi-Fi/MQTT path is ready according to Part A
      *   - first OTA boot: only after rollback validation passes
      */
 }

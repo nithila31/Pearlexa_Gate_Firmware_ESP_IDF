@@ -5,7 +5,7 @@
   "idf.openOcdConfigs": [
     "board/esp32c3-bridge.cfg"
   ],
-  "idf.portWin": "COM16",
+  "idf.portWin": "COM10",
   "idf.toolsPathWin": "C:\\Users\\nsiya\\.espressif",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32c3"
