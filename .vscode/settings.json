@@ -1,0 +1,21 @@
+{
+  "C_Cpp.intelliSenseEngine": "default",
+  "idf.espIdfPathWin": "C:\\Users\\nsiya\\esp\\v5.5.1\\esp-idf",
+  "idf.pythonInstallPath": "C:\\Users\\nsiya\\.espressif\\tools\\idf-python\\3.11.2\\python.exe",
+  "idf.openOcdConfigs": [
+    "board/esp32c3-bridge.cfg"
+  ],
+  "idf.portWin": "COM16",
+  "idf.toolsPathWin": "C:\\Users\\nsiya\\.espressif",
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32c3"
+  },
+  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=d:\\Pearlexa (Pvt) Ltd\\Pearlexa Products\\Gates\\PX-SG100-DC250-24-X-V1\\Software\\For ESP32\\ESP_IDF\\Git Rep\\Pearlexa_Gate_Firmware_ESP_IDF\\build"
+  ],
+  "idf.flashType": "UART",
+  "idf.currentSetup": "C:\\esp\\v5.5.4\\esp-idf"
+}

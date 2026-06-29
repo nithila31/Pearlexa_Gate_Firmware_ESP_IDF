@@ -1,0 +1,10 @@
+version: "1.0.0"
+description: "Pearlexa reusable ESP-IDF connectivity layer: BLE provisioning, Wi-Fi, MQTT, OTA, app lifecycle callbacks. Local component included inside this project."
+license: "Custom"
+targets:
+  - esp32
+  - esp32c3
+files:
+  use_gitignore: true
+dependencies:
+  idf: ">=5.1"
