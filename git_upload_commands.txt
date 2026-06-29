@@ -1,0 +1,13 @@
+Run these commands inside this folder:
+
+git init
+git add .
+git commit -m "Initial Pearlexa gate firmware with local pearlexa_connect v1.0.0"
+git branch -M main
+
+# Create a private GitHub repo manually, then add its URL here:
+git remote add origin https://github.com/Pearlexa/Pearlexa_Gate_Firmware.git
+git push -u origin main
+
+git tag v1.0.0
+git push origin v1.0.0

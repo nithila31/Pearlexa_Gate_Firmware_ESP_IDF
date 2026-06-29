@@ -1,0 +1,26 @@
+# ESP-IDF build outputs
+/build/
+managed_components/
+dependencies.lock
+sdkconfig.old
+
+# CMake / Ninja
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+*.ninja
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# IDE / OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Logs
+*.log
